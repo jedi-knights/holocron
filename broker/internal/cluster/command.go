@@ -1,0 +1,135 @@
+// Package cluster wires hashicorp/raft into a holocron broker so that
+// produce and topic-create operations are replicated across N nodes.
+//
+// One Raft cluster per broker (not per partition). Every accepted Append
+// or CreateTopic becomes a Raft command; the FSM applies it to the local
+// FileStore + Registry. Followers serve reads from their applied state
+// (eventual consistency); writes must go through the leader.
+//
+// Per-partition Raft would let leadership spread across nodes for higher
+// total throughput. Holocron picks one cluster-wide leader for simplicity;
+// the limitation is documented in docs/stage-5.md.
+package cluster
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+
+	"github.com/jedi-knights/holocron/proto"
+)
+
+// CommandKind tags each Raft log entry's payload type.
+type CommandKind uint8
+
+const (
+	// CmdAppend records a single produce: append `Record` to (Topic, Partition).
+	CmdAppend CommandKind = 1
+	// CmdCreateTopic registers a topic with the given spec.
+	CmdCreateTopic CommandKind = 2
+)
+
+// AppendCommand is the FSM payload for an append.
+type AppendCommand struct {
+	Topic     string
+	Partition int32
+	Record    proto.Record
+}
+
+// CreateTopicCommand is the FSM payload for a topic creation.
+type CreateTopicCommand struct {
+	Name           string
+	PartitionCount int32
+	RetentionMs    int64
+	SegmentBytes   int64
+}
+
+// EncodeAppend serializes an AppendCommand. Layout:
+//
+//	[1] kind = CmdAppend
+//	[2 + N] topic length + bytes
+//	[4] partition (int32 BE)
+//	[record body — wire-format proto.Record minus its frame]
+func EncodeAppend(c AppendCommand) []byte {
+	buf := []byte{byte(CmdAppend)}
+	buf = appendString(buf, c.Topic)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(c.Partition))
+	rec := proto.ProduceRequest{Topic: c.Topic, Partition: c.Partition, Record: c.Record}.Encode()
+	// ProduceRequest.Encode embeds topic+partition+record; for the FSM we
+	// only need the record bytes, but reusing the encoder keeps the format
+	// stable. Followers decode via DecodeProduceRequest.
+	buf = append(buf, rec...)
+	return buf
+}
+
+// EncodeCreateTopic serializes a CreateTopicCommand.
+func EncodeCreateTopic(c CreateTopicCommand) []byte {
+	buf := []byte{byte(CmdCreateTopic)}
+	buf = appendString(buf, c.Name)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(c.PartitionCount))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(c.RetentionMs))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(c.SegmentBytes))
+	return buf
+}
+
+// Decode parses the leading kind byte and returns the kind plus the
+// remaining body. The caller dispatches on kind.
+func Decode(b []byte) (CommandKind, []byte, error) {
+	if len(b) == 0 {
+		return 0, nil, errors.New("cluster: empty command")
+	}
+	return CommandKind(b[0]), b[1:], nil
+}
+
+// DecodeAppend parses an AppendCommand body (kind byte already consumed).
+func DecodeAppend(body []byte) (AppendCommand, error) {
+	topic, n, err := readString(body)
+	if err != nil {
+		return AppendCommand{}, fmt.Errorf("cluster: append topic: %w", err)
+	}
+	body = body[n:]
+	if len(body) < 4 {
+		return AppendCommand{}, errors.New("cluster: short append command")
+	}
+	partition := int32(binary.BigEndian.Uint32(body[:4]))
+	body = body[4:]
+	req, err := proto.DecodeProduceRequest(body)
+	if err != nil {
+		return AppendCommand{}, fmt.Errorf("cluster: append record: %w", err)
+	}
+	return AppendCommand{Topic: topic, Partition: partition, Record: req.Record}, nil
+}
+
+// DecodeCreateTopic parses a CreateTopicCommand body.
+func DecodeCreateTopic(body []byte) (CreateTopicCommand, error) {
+	name, n, err := readString(body)
+	if err != nil {
+		return CreateTopicCommand{}, fmt.Errorf("cluster: create-topic name: %w", err)
+	}
+	body = body[n:]
+	if len(body) < 20 {
+		return CreateTopicCommand{}, errors.New("cluster: short create-topic command")
+	}
+	return CreateTopicCommand{
+		Name:           name,
+		PartitionCount: int32(binary.BigEndian.Uint32(body[0:4])),
+		RetentionMs:    int64(binary.BigEndian.Uint64(body[4:12])),
+		SegmentBytes:   int64(binary.BigEndian.Uint64(body[12:20])),
+	}, nil
+}
+
+func appendString(buf []byte, s string) []byte {
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(s)))
+	return append(buf, s...)
+}
+
+func readString(b []byte) (string, int, error) {
+	if len(b) < 4 {
+		return "", 0, errors.New("cluster: short string")
+	}
+	n := binary.BigEndian.Uint32(b[:4])
+	if uint32(len(b)-4) < n {
+		return "", 0, errors.New("cluster: truncated string")
+	}
+	return string(b[4 : 4+n]), 4 + int(n), nil
+}

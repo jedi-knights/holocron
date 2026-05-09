@@ -1,0 +1,12 @@
+go 1.23
+
+use (
+	./broker
+	./cli
+	./connect
+	./examples
+	./proto
+	./registry
+	./sdk
+	./streams
+)

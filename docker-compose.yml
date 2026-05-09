@@ -1,0 +1,115 @@
+# Profiles (pass --profile <name> to docker compose):
+#   single    - one broker on :9092
+#   registry  - one broker + the schema registry on :8081
+#   cluster   - 3-node Raft cluster on :9091 / :9092 / :9093
+#
+# `docker compose up` (no profile) brings up nothing; pick one explicitly.
+# Examples (producer / consumer / connect / streams) run via
+# `go run ./examples/<name>` against any of the above.
+
+services:
+  # ----- single broker (--profile single, --profile registry) -----
+  broker:
+    profiles: ["single", "registry"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: holocrond
+    image: holocron/broker:dev
+    container_name: holocron-broker
+    ports:
+      - "9092:9092"
+    volumes:
+      - holocron-data:/var/lib/holocron
+    environment:
+      HOLOCRON_DATA_DIR: /var/lib/holocron
+      HOLOCRON_LISTEN: ":9092"
+
+  # ----- schema registry, opt-in via `--profile registry` -----
+  registry:
+    profiles: ["registry"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: holocron-registry
+    image: holocron/registry:dev
+    container_name: holocron-registry
+    ports:
+      - "8081:8081"
+    depends_on:
+      - broker
+    environment:
+      HOLOCRON_BROKER: broker:9092
+      HOLOCRON_REGISTRY_LISTEN: ":8081"
+
+  # ----- 3-node Raft cluster, opt-in via `--profile cluster` -----
+  # Each node listens on its own wire port (909{1,2,3}) and Raft port
+  # (919{1,2,3}). Only n1 bootstraps; n2 and n3 join via the static
+  # peer list in --peers.
+  n1:
+    profiles: ["cluster"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: holocrond
+    image: holocron/broker:dev
+    container_name: holocron-n1
+    ports:
+      - "9091:9091"
+    volumes:
+      - holocron-n1:/var/lib/holocron
+    command:
+      - "--cluster"
+      - "--node-id=n1"
+      - "--listen=:9091"
+      - "--raft-listen=:9191"
+      - "--peers=n1=n1:9191=n1:9091,n2=n2:9192=n2:9092,n3=n3:9193=n3:9093"
+      - "--bootstrap"
+
+  n2:
+    profiles: ["cluster"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: holocrond
+    image: holocron/broker:dev
+    container_name: holocron-n2
+    ports:
+      - "9092:9092"
+    volumes:
+      - holocron-n2:/var/lib/holocron
+    depends_on:
+      - n1
+    command:
+      - "--cluster"
+      - "--node-id=n2"
+      - "--listen=:9092"
+      - "--raft-listen=:9192"
+      - "--peers=n1=n1:9191=n1:9091,n2=n2:9192=n2:9092,n3=n3:9193=n3:9093"
+
+  n3:
+    profiles: ["cluster"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: holocrond
+    image: holocron/broker:dev
+    container_name: holocron-n3
+    ports:
+      - "9093:9093"
+    volumes:
+      - holocron-n3:/var/lib/holocron
+    depends_on:
+      - n1
+    command:
+      - "--cluster"
+      - "--node-id=n3"
+      - "--listen=:9093"
+      - "--raft-listen=:9193"
+      - "--peers=n1=n1:9191=n1:9091,n2=n2:9192=n2:9092,n3=n3:9193=n3:9093"
+
+volumes:
+  holocron-data:
+  holocron-n1:
+  holocron-n2:
+  holocron-n3:

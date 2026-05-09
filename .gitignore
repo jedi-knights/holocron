@@ -1,0 +1,33 @@
+# Personal scratch / planning — never commit
+TODO.md
+example.txt
+
+# Build artifacts
+bin/
+dist/
+*.exe
+*.test
+*.out
+/cli/holocronctl
+/cli/holocron-registry
+/registry/cmd/holocron-registry/holocron-registry
+/broker/cmd/holocrond/holocrond
+
+# Broker data directories
+/var/
+data/
+*.log
+*.idx
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go
+vendor/
+coverage.out
+coverage.html
+go.work.sum
