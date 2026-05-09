@@ -15,6 +15,32 @@ import (
 	"github.com/jedi-knights/holocron/sdk"
 )
 
+// headerFlag is a flag.Value that accumulates repeated --header
+// invocations into a slice of proto.Header. Each value is parsed as
+// `key=value`; the first '=' separates the two parts so values
+// containing '=' work correctly.
+type headerFlag []proto.Header
+
+func (h *headerFlag) String() string {
+	if h == nil || len(*h) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(*h))
+	for _, hdr := range *h {
+		parts = append(parts, fmt.Sprintf("%s=%s", hdr.Key, hdr.Value))
+	}
+	return strings.Join(parts, ",")
+}
+
+func (h *headerFlag) Set(s string) error {
+	k, v, ok := strings.Cut(s, "=")
+	if !ok {
+		return fmt.Errorf("header %q: missing '=' separator", s)
+	}
+	*h = append(*h, proto.Header{Key: k, Value: []byte(v)})
+	return nil
+}
+
 // runProduce sends records to a topic. Two modes:
 //
 //   - Single-record mode: --value (and optionally --key) supplies
@@ -35,7 +61,10 @@ func runProduce(args []string) error {
 	value := fs.String("value", "", "record value (omit to read records from stdin)")
 	keySep := fs.String("key-sep", "", "stdin mode: split each line on first occurrence into key+value")
 	batch := fs.Bool("batch", false, "stdin mode: ship all stdin records as one SendBatch instead of N Sends")
+	idempotent := fs.Bool("idempotent", false, "stamp producer-id/sequence headers so the broker dedups retried writes")
 	timeout := fs.Duration("timeout", 30*time.Second, "RPC timeout (covers all records in stdin mode)")
+	var headers headerFlag
+	fs.Var(&headers, "header", "header in key=value form (repeatable; applies to every record)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -49,7 +78,11 @@ func runProduce(args []string) error {
 	}
 	defer tr.Close()
 
-	prod, err := sdk.NewProducer(tr)
+	var prodOpts []sdk.ProducerOption
+	if *idempotent {
+		prodOpts = append(prodOpts, sdk.WithIdempotency())
+	}
+	prod, err := sdk.NewProducer(tr, prodOpts...)
 	if err != nil {
 		return err
 	}
@@ -64,6 +97,9 @@ func runProduce(args []string) error {
 		if *key != "" {
 			rec.Key = []byte(*key)
 		}
+		if len(headers) > 0 {
+			rec.Headers = append([]proto.Header(nil), headers...)
+		}
 		off, err := prod.Send(ctx, *topic, rec)
 		if err != nil {
 			return fmt.Errorf("send: %w", err)
@@ -72,16 +108,17 @@ func runProduce(args []string) error {
 		return nil
 	}
 
-	// Stdin mode: one record per line.
+	// Stdin mode: one record per line. Headers, when supplied,
+	// apply to every record.
 	if *batch {
-		count, err := produceBatchFromReader(ctx, prod, *topic, os.Stdin, *keySep)
+		count, err := produceBatchFromReader(ctx, prod, *topic, os.Stdin, *keySep, headers)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("produced %d record(s) to %s in one batch\n", count, *topic)
 		return nil
 	}
-	count, err := produceFromReader(ctx, prod, *topic, os.Stdin, *keySep)
+	count, err := produceFromReader(ctx, prod, *topic, os.Stdin, *keySep, headers)
 	if err != nil {
 		return err
 	}
@@ -99,7 +136,7 @@ func runProduce(args []string) error {
 // FIRST record (broker's per-partition append guarantees ordering
 // only within a partition). For best results pre-key your records
 // or accept that the bulk lands together.
-func produceBatchFromReader(ctx context.Context, prod *sdk.Producer, topic string, r io.Reader, keySep string) (int, error) {
+func produceBatchFromReader(ctx context.Context, prod *sdk.Producer, topic string, r io.Reader, keySep string, headers []proto.Header) (int, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	var records []proto.Record
@@ -116,6 +153,9 @@ func produceBatchFromReader(ctx context.Context, prod *sdk.Producer, topic strin
 			} else {
 				rec.Value = []byte(line)
 			}
+		}
+		if len(headers) > 0 {
+			rec.Headers = append([]proto.Header(nil), headers...)
 		}
 		records = append(records, rec)
 	}
@@ -135,7 +175,7 @@ func produceBatchFromReader(ctx context.Context, prod *sdk.Producer, topic strin
 // the count of successfully-sent records. With keySep non-empty,
 // each line is split on the first occurrence into (key, value);
 // otherwise the whole line becomes the record value.
-func produceFromReader(ctx context.Context, prod *sdk.Producer, topic string, r io.Reader, keySep string) (int, error) {
+func produceFromReader(ctx context.Context, prod *sdk.Producer, topic string, r io.Reader, keySep string, headers []proto.Header) (int, error) {
 	scanner := bufio.NewScanner(r)
 	// Allow long lines (default Scanner cap is 64KiB).
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -153,6 +193,9 @@ func produceFromReader(ctx context.Context, prod *sdk.Producer, topic string, r 
 			} else {
 				rec.Value = []byte(line)
 			}
+		}
+		if len(headers) > 0 {
+			rec.Headers = append([]proto.Header(nil), headers...)
 		}
 		if _, err := prod.Send(ctx, topic, rec); err != nil {
 			return count, fmt.Errorf("send line %d: %w", count+1, err)

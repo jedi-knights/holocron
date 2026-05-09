@@ -39,11 +39,12 @@ type Transport struct {
 	tlsConfig   *tls.Config
 	apiKey      string
 
-	mu     sync.Mutex
-	rpc    *connection // shared connection for unary RPCs (produce, metadata, commit, create)
-	hb     *connection // dedicated connection for long-poll Heartbeat calls
-	codec  proto.Codec
-	closed bool
+	mu           sync.Mutex
+	rpc          *connection // shared connection for unary RPCs (produce, metadata, commit, create)
+	hb           *connection // dedicated connection for long-poll Heartbeat calls
+	codec        proto.Codec
+	codecLevel   uint8 // LZ4 level: 0 = fast, 1..9 = HC at that level
+	closed       bool
 
 	subWG     sync.WaitGroup
 	subCancel []context.CancelFunc
@@ -55,6 +56,17 @@ type Transport struct {
 func (t *Transport) SetCompression(c proto.Codec) {
 	t.mu.Lock()
 	t.codec = c
+	t.mu.Unlock()
+}
+
+// SetCompressionLevel sets the LZ4 compression level for outgoing
+// PublishBatch payloads. 0 picks the fast LZ4 compressor (default);
+// 1..9 use LZ4-HC at that level for higher ratio at higher CPU
+// cost. The wire format is identical for both variants. Only
+// effective when SetCompression has selected CodecLZ4.
+func (t *Transport) SetCompressionLevel(level uint8) {
+	t.mu.Lock()
+	t.codecLevel = level
 	t.mu.Unlock()
 }
 
@@ -125,11 +137,13 @@ func (t *Transport) PublishBatch(ctx context.Context, p proto.PartitionRef, reco
 	}
 	t.mu.Lock()
 	codec := t.codec
+	level := t.codecLevel
 	t.mu.Unlock()
 	body, err := t.do(ctx, proto.OpProduceBatch, proto.ProduceBatchRequest{
 		Topic:     p.Topic,
 		Partition: p.Index,
 		Codec:     codec,
+		Level:     level,
 		Records:   records,
 	}.Encode())
 	if err != nil {
@@ -435,6 +449,34 @@ func (t *Transport) DescribeGroup(ctx context.Context, group string) (proto.Desc
 		return proto.DescribeGroupResponse{}, err
 	}
 	return proto.DecodeDescribeGroupResponse(body)
+}
+
+// ListGroupOffsets returns each (topic, partition, committed,
+// high-water) entry for the named group. The lag is HighWater -
+// Committed; the broker emits the raw pair so a CLI can decide
+// whether to display lag, raw values, or both. An unknown group
+// returns an empty slice rather than an error — committed-offset
+// state outlives the in-memory group registration.
+func (t *Transport) ListGroupOffsets(ctx context.Context, group string) ([]proto.GroupOffsetEntry, error) {
+	body, err := t.do(ctx, proto.OpListGroupOffsets, proto.ListGroupOffsetsRequest{Group: group}.Encode())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := proto.DecodeListGroupOffsetsResponse(body)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Entries, nil
+}
+
+// DeleteGroup drops the named consumer group from the broker and
+// clears every committed offset under it. Returns an error wrapping
+// proto.StatusUnknownMember when the group has no in-memory
+// registration AND no committed offsets — operator scripts that
+// want idempotency can squelch on that status.
+func (t *Transport) DeleteGroup(ctx context.Context, group string) error {
+	_, err := t.do(ctx, proto.OpDeleteGroup, proto.DeleteGroupRequest{Group: group}.Encode())
+	return err
 }
 
 // EnsureTopic creates the topic if it doesn't exist, returning nil if a

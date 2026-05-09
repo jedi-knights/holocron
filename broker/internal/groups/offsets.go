@@ -21,7 +21,19 @@ const NoOffset = int64(-1)
 type OffsetStore interface {
 	Commit(group, topic string, partition int32, offset int64) error
 	Lookup(group, topic string, partition int32) (int64, error)
+	List(group string) []OffsetEntry
+	DeleteGroup(group string) error
 	Close() error
+}
+
+// OffsetEntry is one (topic, partition, offset) tuple committed under
+// a particular consumer group. Returned by OffsetStore.List so an
+// operator-facing API can enumerate the partitions a group has touched
+// without needing to know the topic/partition layout up front.
+type OffsetEntry struct {
+	Topic     string
+	Partition int32
+	Offset    int64
 }
 
 // offsetKey is the disk representation of one commit entry. Group, topic,
@@ -61,6 +73,24 @@ func (m *MemoryOffsetStore) Lookup(group, topic string, partition int32) (int64,
 		return v, nil
 	}
 	return NoOffset, nil
+}
+
+// List returns every (topic, partition, offset) entry committed under
+// group. Order is unspecified — callers that need stable order sort
+// the result.
+func (m *MemoryOffsetStore) List(group string) []OffsetEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return listEntries(m.entries, group)
+}
+
+// DeleteGroup drops every commit recorded under group. Used by
+// operator-driven group cleanup; pairs with Manager.Delete.
+func (m *MemoryOffsetStore) DeleteGroup(group string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	deleteGroupEntries(m.entries, group)
+	return nil
 }
 
 // Close is a no-op for the in-memory store.
@@ -126,6 +156,24 @@ func (s *JSONOffsetStore) Lookup(group, topic string, partition int32) (int64, e
 	return NoOffset, nil
 }
 
+// List returns every (topic, partition, offset) entry committed under
+// group. Order is unspecified.
+func (s *JSONOffsetStore) List(group string) []OffsetEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return listEntries(s.entries, group)
+}
+
+// DeleteGroup drops every commit recorded under group and rewrites
+// the JSON file so the change survives a restart.
+func (s *JSONOffsetStore) DeleteGroup(group string) error {
+	s.mu.Lock()
+	deleteGroupEntries(s.entries, group)
+	snapshot := s.snapshotLocked()
+	s.mu.Unlock()
+	return s.persist(snapshot)
+}
+
 // Close is a no-op; commits are flushed synchronously.
 func (s *JSONOffsetStore) Close() error { return nil }
 
@@ -151,6 +199,32 @@ func (s *JSONOffsetStore) persist(snapshot []offsetKey) error {
 		return err
 	}
 	return os.Rename(tmp, s.path)
+}
+
+// deleteGroupEntries removes every entry keyed under group from the
+// shared (joinKey-keyed) map. Shared by Memory/JSON stores so the
+// matching logic lives in one place.
+func deleteGroupEntries(entries map[string]int64, group string) {
+	for k := range entries {
+		if g, _, _ := splitKey(k); g == group {
+			delete(entries, k)
+		}
+	}
+}
+
+// listEntries projects entries (keyed by joinKey) down to the subset
+// belonging to the named group. Shared by Memory/JSON/Topic stores so
+// the enumeration logic lives in one place.
+func listEntries(entries map[string]int64, group string) []OffsetEntry {
+	out := make([]OffsetEntry, 0)
+	for k, off := range entries {
+		g, topic, partition := splitKey(k)
+		if g != group {
+			continue
+		}
+		out = append(out, OffsetEntry{Topic: topic, Partition: partition, Offset: off})
+	}
+	return out
 }
 
 func joinKey(group, topic string, partition int32) string {

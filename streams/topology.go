@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,12 +25,14 @@ type TimestampExtractor func(proto.Record) int64
 func DefaultTimestampExtractor(r proto.Record) int64 { return r.Timestamp }
 
 type Topology struct {
-	transport       sdk.Transport
-	maxTasks        int
-	useChangelog    bool
-	tsExtractor     TimestampExtractor
-	punctuationInt  time.Duration
-	idleWatermarkD  time.Duration
+	transport      sdk.Transport
+	maxTasks       int
+	useChangelog   bool
+	tsExtractor    TimestampExtractor
+	punctuationInt time.Duration
+	idleWatermarkD time.Duration
+	onError        ErrorHandler
+	dlqTopic       string
 
 	mu           sync.Mutex
 	pipes        []pipeline
@@ -85,6 +89,47 @@ func WithTimestampExtractor(fn TimestampExtractor) Option {
 // punctuator (windows close lazily on the next record).
 func WithPunctuationInterval(d time.Duration) Option {
 	return func(t *Topology) { t.punctuationInt = d }
+}
+
+// ErrorHandler observes errors that occur inside pipeline goroutines —
+// op panics, sink-produce failures, consumer poll errors. Without
+// a handler errors only surface via Stop()'s aggregated return;
+// with one, monitoring code sees them live.
+//
+// The handler runs on the pipeline goroutine that observed the
+// error, so it must be cheap and non-blocking. Long-running work
+// belongs in a downstream queue.
+type ErrorHandler func(err error)
+
+// WithErrorHandler registers a callback fired live whenever a
+// pipeline error is recorded. Pairs with the existing recordErr
+// surface (which collects errors for Stop) — the handler observes
+// the same errors as they happen.
+//
+// Op panics inside pipeline closures are recovered and routed to
+// the handler instead of killing the goroutine, so a buggy op
+// doesn't take down the whole pipeline. Records that triggered the
+// panic are dropped; subsequent records continue to flow.
+func WithErrorHandler(fn ErrorHandler) Option {
+	return func(t *Topology) { t.onError = fn }
+}
+
+// WithDLQ routes records that panicked a pipeline op to the named
+// dead-letter-queue topic. The DLQ record preserves the original
+// record's key, value, and headers; an extra `holocron.dlq.error`
+// header carries the panic message for forensic context.
+//
+// Pairs with WithErrorHandler — handler fires for live
+// observability, DLQ captures the record for replay or
+// investigation. The DLQ produce is best-effort: a failure to
+// write the DLQ doesn't affect the pipeline, just gets recorded
+// via recordErr like any other internal failure. The topic must
+// exist beforehand.
+const HeaderDLQError = "holocron.dlq.error"
+
+// WithDLQ option.
+func WithDLQ(topic string) Option {
+	return func(t *Topology) { t.dlqTopic = topic }
 }
 
 // WithIdleWatermark enables a topology-level idle-detection goroutine.
@@ -260,6 +305,150 @@ func (s *Stream) withPunctuator(fn PunctuatorFunc) *Stream {
 	return &next
 }
 
+// Throttle caps emission to perSec records per second using a
+// token bucket with capacity = perSec. A burst arriving in less
+// time than 1/perSec drains the bucket; subsequent records during
+// the burst are dropped until tokens refill.
+//
+// Drop-based, not blocking — pipelines can't queue records past an
+// op so a blocking throttle would stall every upstream task. Use
+// for cost control and downstream backpressure where dropping is
+// preferable to queuing.
+//
+// perSec <= 0 drops everything; if you want unthrottled, just
+// don't insert this op. Concurrent tasks share one bucket via a
+// mutex so the rate is global.
+func (s *Stream) Throttle(perSec float64) *Stream {
+	if perSec <= 0 {
+		return s.Filter(func(proto.Record) bool { return false })
+	}
+	var (
+		mu     sync.Mutex
+		tokens = perSec // bucket starts full so the first burst gets `perSec` tokens
+		lastNs = time.Now().UnixNano()
+	)
+	cap := perSec
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
+		mu.Lock()
+		defer mu.Unlock()
+		now := time.Now().UnixNano()
+		elapsed := float64(now-lastNs) / 1e9
+		lastNs = now
+		tokens += elapsed * perSec
+		if tokens > cap {
+			tokens = cap
+		}
+		if tokens < 1 {
+			return nil
+		}
+		tokens -= 1
+		return []proto.Record{r}
+	})
+}
+
+// Sample emits the 1st record and every nth record thereafter,
+// dropping the rest. n=1 is a no-op (every record passes); n<=0
+// drops everything. Shared atomic counter across multi-task
+// pipelines so the sampling rate is global, not per-task.
+//
+// Useful for downsampling high-volume streams when a
+// representative subset is wanted rather than a windowed
+// aggregate. The 1st-record bias means downstream observers see
+// data immediately rather than waiting for the first n records to
+// pass.
+func (s *Stream) Sample(n int) *Stream {
+	if n == 1 {
+		return s
+	}
+	if n <= 0 {
+		return s.Filter(func(proto.Record) bool { return false })
+	}
+	step := int64(n)
+	var seen atomic.Int64
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
+		// 1, n+1, 2n+1, ... pass. seen-1 gives the zero-based
+		// index of this record so the modulo lands the boundary
+		// on indices 0, n, 2n, ... — i.e. records 1, n+1, 2n+1.
+		idx := seen.Add(1) - 1
+		if idx%step != 0 {
+			return nil
+		}
+		return []proto.Record{r}
+	})
+}
+
+// Distinct drops records whose derived key has been seen before in
+// this pipeline run. keyFn extracts the dedup key from the record;
+// returning a zero-length slice keys on "no key" (one such record
+// will pass through, the rest are dropped).
+//
+// Dedup state is in-memory only — a topology restart resets it.
+// The operator is responsible for bounding cardinality: a stream
+// of all-distinct keys will eventually grow the internal map. For
+// time-bounded dedup, pair with a windowed aggregation instead.
+//
+// With multi-task pipelines the seen-set is shared via a
+// concurrent map, so cross-task duplicates are filtered too.
+func (s *Stream) Distinct(keyFn func(proto.Record) []byte) *Stream {
+	var seen sync.Map // string(key) → struct{}{}
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
+		k := string(keyFn(r))
+		if _, loaded := seen.LoadOrStore(k, struct{}{}); loaded {
+			return nil
+		}
+		return []proto.Record{r}
+	})
+}
+
+// Skip drops the first n records that flow through the pipeline
+// and passes through everything after. Inverse of Take. Shared
+// atomic counter across multi-task pipelines so the dropped
+// prefix is global, not per-task.
+//
+// Useful for "skip the historical bootstrap" scenarios when the
+// pipeline restarts from offset 0 but the operator only cares
+// about records past a certain point.
+func (s *Stream) Skip(n int) *Stream {
+	if n <= 0 {
+		return s
+	}
+	skipUntil := int64(n)
+	var seen atomic.Int64
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
+		if seen.Add(1) <= skipUntil {
+			return nil
+		}
+		return []proto.Record{r}
+	})
+}
+
+// Take caps emission at n records — past the cap, the operator
+// drops every record. The pipeline keeps consuming from the source
+// so committed offsets advance, but produces no output past the
+// cap. With multi-task pipelines the counter is shared via a
+// captured atomic so the cap is global, not per-task.
+//
+// Useful for bounded test pipelines, replay-up-to-N scenarios, and
+// circuit-breakers that should let only a prefix of a stream
+// through. Returns a fresh Stream; callers chain a sink (.To, etc.)
+// to finalize.
+func (s *Stream) Take(n int) *Stream {
+	if n <= 0 {
+		return s.Filter(func(proto.Record) bool { return false })
+	}
+	limit := int64(n)
+	var seen atomic.Int64
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
+		// Increment-then-check so concurrent tasks can't both
+		// observe seen<limit and both emit a record that pushes
+		// the count past the cap.
+		if seen.Add(1) > limit {
+			return nil
+		}
+		return []proto.Record{r}
+	})
+}
+
 // Filter drops records where pred returns false.
 func (s *Stream) Filter(pred func(proto.Record) bool) *Stream {
 	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
@@ -352,6 +541,14 @@ func (s *Stream) Peek(fn func(proto.Record)) *Stream {
 	})
 }
 
+// Tap is an alias for Peek matching the Kafka-Streams convention
+// of "tap into the stream" for side effects. Reads more naturally
+// than Peek when the operation is documenting an observation
+// rather than peeking past a wall.
+func (s *Stream) Tap(fn func(proto.Record)) *Stream {
+	return s.Peek(fn)
+}
+
 // Branch splits a stream into N parallel streams, each carrying
 // only the records that match its predicate. Predicates are
 // evaluated in order; a record routes to the FIRST branch whose
@@ -412,6 +609,84 @@ func (s *Stream) To(topic string) {
 		group:       fmt.Sprintf("holocron-streams-%s-%s", s.source, topic),
 		punctuators: append([]PunctuatorFunc(nil), s.punctuators...),
 	})
+}
+
+// ToTable materializes the upstream pipeline into a KTable backed
+// by the named state store. Each output record updates the table
+// last-value-wins by key; a record with nil Value tombstones the
+// key. Records without a Key are ignored — the table's identity is
+// its key space. State is partition-scoped via the partitioned
+// store, the same as Count/Aggregate/Reduce.
+//
+// Returns the resulting KTable so a subsequent JoinTable can look up
+// against it. The pipeline is finalized as a terminal — no sink
+// topic — and further chaining on the source Stream has no effect.
+//
+// Without ToTable the only way to derive a table from a transformed
+// stream is `s.Through(topic); top.Table(topic, store)`, which
+// requires creating an intermediate topic and runs an extra consumer
+// goroutine to replay it. ToTable does the materialization in-place.
+func (s *Stream) ToTable(storeName string) *KTable {
+	store := s.topology.Store(storeName)
+	updated := s.appendOp(func(r proto.Record, _ *Topology, partition int) []proto.Record {
+		if r.Key == nil {
+			return nil
+		}
+		sub := store.For(partition)
+		if r.Value == nil {
+			sub.Delete(r.Key)
+		} else {
+			sub.Put(append([]byte(nil), r.Key...), append([]byte(nil), r.Value...))
+		}
+		return nil
+	})
+	updated.ForEach()
+	// The returned KTable is a free-standing read view — it shares
+	// the store with the just-registered ForEach pipeline but is
+	// NOT added to t.tables, so the topology won't spawn a runTable
+	// consumer for it. The upstream pipeline is the only writer.
+	return &KTable{
+		topology: s.topology,
+		source:   "",
+		store:    store,
+		group:    "",
+	}
+}
+
+// Print registers a terminal that writes one debug line per record
+// to os.Stdout, prefixed with prefix. Sugar for the common
+// `ForEachFunc(func(r) { fmt.Println(...) })` pattern when
+// debugging a pipeline. Output format:
+//
+//	prefix offset=N key=K value=V
+//
+// PrintTo lets callers redirect to any io.Writer (a test buffer,
+// log writer, or io.Discard for benchmarks).
+func (s *Stream) Print(prefix string) {
+	s.PrintTo(os.Stdout, prefix)
+}
+
+// PrintTo registers a debug terminal that writes one line per
+// record to w, prefixed with prefix. See Print for format.
+func (s *Stream) PrintTo(w io.Writer, prefix string) {
+	s.ForEachFunc(func(r proto.Record) {
+		fmt.Fprintf(w, "%s offset=%d key=%q value=%q\n", prefix, r.Offset, r.Key, r.Value)
+	})
+}
+
+// ForEachFunc registers a terminal that calls fn for every record
+// flowing through the pipeline. Sister to ForEach() (passive,
+// state-store-only): use ForEachFunc when records should reach a
+// non-topic sink — logger, metrics emitter, external system —
+// without an intermediate Peek upstream of an empty ForEach.
+//
+// fn must not retain references to r; the runtime reuses Record
+// instances. Copy fields if you need to outlive the call.
+//
+// Pipeline finalized just like ForEach — further chaining on s has
+// no effect.
+func (s *Stream) ForEachFunc(fn func(proto.Record)) {
+	s.Peek(fn).ForEach()
 }
 
 // ForEach registers the pipeline as a terminal — records are processed
@@ -509,6 +784,29 @@ func (g *GroupedStream) Reduce(storeName string, fn func(accum, value []byte) []
 	})
 }
 
+// Sum is a pre-canned numeric aggregation: extracts an int64 from
+// each record via valueFn and accumulates per-key totals. State is
+// encoded as 8-byte big-endian int64 — readable via DecodeCount.
+//
+// Sugar over Aggregate with a fixed accumulator. Useful for
+// running totals (revenue per customer, bytes per source, etc.)
+// where Reduce's "operate on bytes" surface is awkward.
+func (g *GroupedStream) Sum(storeName string, valueFn func(proto.Record) int64) *Stream {
+	store := g.stream.topology.Store(storeName)
+	return g.stream.appendOp(func(r proto.Record, _ *Topology, partition int) []proto.Record {
+		sub := store.For(partition)
+		prev, _ := sub.Get(r.Key)
+		next := int64(DecodeCount(prev)) + valueFn(r)
+		encoded := EncodeCount(uint64(next))
+		sub.Put(r.Key, encoded)
+		return []proto.Record{{
+			Key:     append([]byte(nil), r.Key...),
+			Value:   encoded,
+			Headers: r.Headers,
+		}}
+	})
+}
+
 // Aggregate emits an updated value per key by combining the previous
 // aggregate with the new record. The aggregator receives the existing
 // value (nil if first time), the incoming record, and returns the new
@@ -562,11 +860,58 @@ func DecodeCount(b []byte) uint64 {
 // (e.g. Count's Get/Put) loses increments to the resulting churn.
 const streamsHeartbeatInterval = 200 * time.Millisecond
 
-// recordErr stashes a per-pipeline error for Stop to surface.
+// recordErr stashes a per-pipeline error for Stop to surface and
+// fires the user's WithErrorHandler callback if registered. Both
+// happen under the errsMu lock, so the handler sees errors in the
+// order they were recorded.
 func (t *Topology) recordErr(err error) {
 	t.errsMu.Lock()
-	defer t.errsMu.Unlock()
 	t.errs = append(t.errs, err)
+	handler := t.onError
+	t.errsMu.Unlock()
+	if handler != nil {
+		handler(err)
+	}
+}
+
+// runOp invokes one pipeline op with panic recovery. If the op
+// panics, the error is recorded (firing any WithErrorHandler), the
+// failing record is best-effort routed to the DLQ topic when
+// WithDLQ is configured, and the function returns nil so the
+// pipeline drops the failing record but keeps processing
+// subsequent ones. Without recovery a buggy op would kill the
+// goroutine and silently drop every downstream record until Stop
+// surfaced the failure.
+func (t *Topology) runOp(o op, r proto.Record, partition int, producer *sdk.Producer) (out []proto.Record) {
+	defer func() {
+		if rv := recover(); rv != nil {
+			err := fmt.Errorf("streams: op panic: %v", rv)
+			t.recordErr(err)
+			if t.dlqTopic != "" && producer != nil {
+				t.routeToDLQ(producer, r, err)
+			}
+			out = nil
+		}
+	}()
+	return o(r, t, partition)
+}
+
+// routeToDLQ produces the failing record to the DLQ topic with an
+// added error-context header. Best-effort: a DLQ failure surfaces
+// via recordErr but doesn't propagate to the caller (which is the
+// recover path of a panic — propagating would defeat recovery).
+func (t *Topology) routeToDLQ(producer *sdk.Producer, r proto.Record, panicErr error) {
+	dlq := proto.Record{
+		Key:   r.Key,
+		Value: r.Value,
+		Headers: append(append([]proto.Header(nil), r.Headers...),
+			proto.Header{Key: HeaderDLQError, Value: []byte(panicErr.Error())}),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := producer.Send(ctx, t.dlqTopic, dlq); err != nil {
+		t.recordErr(fmt.Errorf("streams: dlq produce: %w", err))
+	}
 }
 
 // run drives one pipeline: subscribe to its source topic, apply ops to
@@ -619,7 +964,7 @@ func (t *Topology) run(ctx context.Context, p pipeline, producer *sdk.Producer) 
 			for _, o := range p.ops {
 				next := out[:0]
 				for _, in := range out {
-					next = append(next, o(in, t, partition)...)
+					next = append(next, t.runOp(o, in, partition, producer)...)
 				}
 				out = next
 				if len(out) == 0 {

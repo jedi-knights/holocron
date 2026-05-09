@@ -1,6 +1,7 @@
 package embed_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -791,6 +792,884 @@ func TestConsumer_PauseResume(t *testing.T) {
 	if string(got[0].Value) != "v1" || string(got[1].Value) != "v2" {
 		t.Errorf("resume reads: got %q,%q, want v1,v2", got[0].Value, got[1].Value)
 	}
+}
+
+// TestProducer_CompressionLevel_RoundTripsHighRatio proves a
+// Producer with WithCompression(LZ4) + WithCompressionLevel(9)
+// round-trips a compressible payload through the wire — the broker
+// decompresses correctly regardless of which compressor variant
+// (fast vs HC) the producer used. Level=0 picks the fast path
+// (existing behavior); level>=1 switches to LZ4-HC at that level
+// for a higher ratio at the cost of CPU.
+func TestProducer_CompressionLevel_RoundTripsHighRatio(t *testing.T) {
+	// Arrange — a compressible payload (repeating bytes).
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	addr, err := b.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := holocronnet.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	prod, err := sdk.NewProducer(tr,
+		sdk.WithCompression(sdk.CodecLZ4),
+		sdk.WithCompressionLevel(9),
+		sdk.WithLinger(50*time.Millisecond),
+		sdk.WithBatchSize(100),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	value := bytes.Repeat([]byte("aaaa"), 256) // 1 KiB highly compressible
+	for range 5 {
+		if _, err := prod.Send(ctx, "events", proto.Record{Value: value}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := prod.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert — broker received and stored 5 records intact.
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Assign(ctx, proto.PartitionRef{Topic: "events", Index: 0}, 0); err != nil {
+		t.Fatal(err)
+	}
+	got := drainAtLeast(t, ctx, c, 5)
+	if len(got) < 5 {
+		t.Fatalf("post-decompress reads: got %d, want >= 5", len(got))
+	}
+	for i, r := range got[:5] {
+		if !bytes.Equal(r.Value, value) {
+			t.Errorf("record %d value mismatch (HC level=9 round-trip broke)", i)
+		}
+	}
+}
+
+// TestConsumer_Topics_ReturnsSubscribedTopics proves Topics()
+// surfaces the consumer's topic list. For group consumers, the list
+// is what was passed to Subscribe / SubscribeMany; for self-managed
+// consumers, the unique topics across the current assignment.
+func TestConsumer_Topics_ReturnsSubscribedTopics(t *testing.T) {
+	t.Run("group", func(t *testing.T) {
+		b := embed.NewMemory()
+		defer b.Close()
+		for _, n := range []string{"events", "audits"} {
+			if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c, err := sdk.NewConsumer(b.Transport(), sdk.WithGroup("g"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := c.SubscribeMany(ctx, []string{"events", "audits"}, 0); err != nil {
+			t.Fatal(err)
+		}
+		got := c.Topics()
+		seen := map[string]bool{}
+		for _, n := range got {
+			seen[n] = true
+		}
+		if !seen["events"] || !seen["audits"] {
+			t.Errorf("Topics: got %v, want both events and audits", got)
+		}
+	})
+
+	t.Run("self-managed", func(t *testing.T) {
+		b := embed.NewMemory()
+		defer b.Close()
+		if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 2}); err != nil {
+			t.Fatal(err)
+		}
+		c, err := sdk.NewConsumer(b.Transport())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := c.Assign(ctx, proto.PartitionRef{Topic: "events", Index: 0}, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Assign(ctx, proto.PartitionRef{Topic: "events", Index: 1}, 0); err != nil {
+			t.Fatal(err)
+		}
+		got := c.Topics()
+		if len(got) != 1 || got[0] != "events" {
+			t.Errorf("Topics (self-managed, two partitions of one topic): got %v, want [events]", got)
+		}
+	})
+}
+
+// TestConsumer_SubscribeMany_JoinsAllTopicsAtOnce proves a group
+// consumer can subscribe to multiple topics with one JoinGroup
+// call. Today repeating Subscribe(topic1) and Subscribe(topic2)
+// works but re-triggers JoinGroup each time — wasteful for
+// multi-topic services that know their full topic set up front.
+//
+// SubscribeMany takes the slice and joins once.
+func TestConsumer_SubscribeMany_JoinsAllTopicsAtOnce(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, name := range []string{"events", "audits"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: name, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport(), sdk.WithGroup("g"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Act — single call covers both topics.
+	if err := c.SubscribeMany(ctx, []string{"events", "audits"}, 0); err != nil {
+		t.Fatalf("SubscribeMany: %v", err)
+	}
+
+	// Send one record on each topic.
+	if _, err := prod.Send(ctx, "events", proto.Record{Value: []byte("e1")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prod.Send(ctx, "audits", proto.Record{Value: []byte("a1")}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert — both arrive on this consumer's fan-in.
+	got := drainAtLeast(t, ctx, c, 2)
+	if len(got) < 2 {
+		t.Fatalf("got %d records, want >= 2", len(got))
+	}
+	seen := map[string]bool{}
+	for _, r := range got {
+		seen[string(r.Value)] = true
+	}
+	if !seen["e1"] || !seen["a1"] {
+		t.Errorf("missing topic record: seen=%v", seen)
+	}
+
+	// Assignment should cover both topics.
+	parts := c.Assignment()
+	topics := map[string]bool{}
+	for _, p := range parts {
+		topics[p.Topic] = true
+	}
+	if !topics["events"] || !topics["audits"] {
+		t.Errorf("Assignment: got %v, want both events and audits", topics)
+	}
+}
+
+// TestConsumer_Assignment_SnapshotOfCurrentPartitions proves
+// Assignment returns the partitions this consumer is currently
+// pumping. Closes the gap where AssignFunc/RevokeFunc callbacks
+// were the only way to learn the assignment — synchronous code
+// that wants "what am I responsible for?" had to track it
+// out-of-band.
+func TestConsumer_Assignment_SnapshotOfCurrentPartitions(t *testing.T) {
+	// Arrange — self-managed consumer with two explicit Assigns.
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p0 := proto.PartitionRef{Topic: "events", Index: 0}
+	p1 := proto.PartitionRef{Topic: "events", Index: 1}
+	if err := c.Assign(ctx, p0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Assign(ctx, p1, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act
+	got := c.Assignment()
+
+	// Assert — both partitions surface (order unspecified).
+	if len(got) != 2 {
+		t.Fatalf("Assignment: got %d partitions, want 2 (got=%v)", len(got), got)
+	}
+	seen := map[proto.PartitionRef]bool{}
+	for _, p := range got {
+		seen[p] = true
+	}
+	if !seen[p0] || !seen[p1] {
+		t.Errorf("Assignment: missing one of {p0, p1} in %v", got)
+	}
+}
+
+// TestConsumer_CommitAll_BulkCommitsAcrossAssignment proves
+// CommitAll commits each assigned partition's Position for the
+// consumer's group in one call. Pairs with TotalLag for the
+// "introspect everything → commit everything" pattern; without it
+// callers had to enumerate Assignment() and call Commit per
+// partition.
+func TestConsumer_CommitAll_BulkCommitsAcrossAssignment(t *testing.T) {
+	// Arrange — group consumer with two-partition topic.
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+
+	// Pre-seed both partitions.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := 0; i < 4; i++ {
+		if _, err := b.Transport().Publish(ctx, proto.PartitionRef{Topic: "events", Index: 0}, proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := b.Transport().Publish(ctx, proto.PartitionRef{Topic: "events", Index: 1}, proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c, err := sdk.NewConsumer(b.Transport(), sdk.WithGroup("g"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Subscribe(ctx, "events", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drain everything so Position lands at HW for both partitions.
+	_ = drainAtLeast(t, ctx, c, 6)
+
+	// Act
+	if err := c.CommitAll(ctx); err != nil {
+		t.Fatalf("CommitAll: %v", err)
+	}
+
+	// Assert — committed offsets visible via the broker's
+	// ListGroupOffsets surface match the next-to-read positions
+	// (4 and 2 respectively).
+	tr, err := holocronnet.Dial(addrFromBroker(t, b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	entries, err := tr.ListGroupOffsets(ctx, "g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int32]int64{}
+	for _, e := range entries {
+		got[e.Partition] = e.Committed
+	}
+	if got[0] != 4 {
+		t.Errorf("partition 0 committed: got %d, want 4", got[0])
+	}
+	if got[1] != 2 {
+		t.Errorf("partition 1 committed: got %d, want 2", got[1])
+	}
+}
+
+// addrFromBroker spins up the broker's TCP listener for tests that
+// need to round-trip via the wire transport.
+func addrFromBroker(t *testing.T, b *embed.Broker) string {
+	t.Helper()
+	addr, err := b.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+// TestEmbed_BrokerStats proves Broker.Stats() reports a one-call
+// observability snapshot of the broker — topic count, partition
+// count totaled across topics, and clustering info. Useful for
+// monitoring loops that want a single broker-health readout.
+func TestEmbed_BrokerStats(t *testing.T) {
+	b := embed.NewMemory()
+	defer b.Close()
+
+	// Empty broker: zero topics, zero partitions.
+	stats := b.Stats()
+	if stats.TopicCount != 0 || stats.PartitionCount != 0 {
+		t.Errorf("empty broker: got topics=%d partitions=%d, want 0/0", stats.TopicCount, stats.PartitionCount)
+	}
+	// In-memory broker is a single node — not clustered, but
+	// IsLeader convention is true (single-node "leader of itself").
+	if !stats.IsLeader {
+		t.Errorf("single-node broker: IsLeader=false, want true")
+	}
+
+	// Add 2 topics with different partition counts.
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CreateTopic(embed.TopicSpec{Name: "audits", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	stats = b.Stats()
+	if stats.TopicCount != 2 {
+		t.Errorf("TopicCount: got %d, want 2", stats.TopicCount)
+	}
+	if stats.PartitionCount != 5 {
+		t.Errorf("PartitionCount: got %d, want 5 (4+1)", stats.PartitionCount)
+	}
+}
+
+// TestConsumer_Stats_AggregatesObservability proves Stats() returns
+// a single ConsumerStats covering Topics, Assignment, PolledCount,
+// and per-partition Position. The fields a monitoring caller wants
+// in one go rather than five method invocations.
+func TestConsumer_Stats_AggregatesObservability(t *testing.T) {
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p0 := proto.PartitionRef{Topic: "events", Index: 0}
+	p1 := proto.PartitionRef{Topic: "events", Index: 1}
+	if err := c.Assign(ctx, p0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Assign(ctx, p1, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Produce 3 + 2 records and drain everything.
+	for i := 0; i < 3; i++ {
+		if _, err := b.Transport().Publish(ctx, p0, proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := b.Transport().Publish(ctx, p1, proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = drainAtLeast(t, ctx, c, 5)
+
+	stats := c.Stats()
+	if len(stats.Topics) != 1 || stats.Topics[0] != "events" {
+		t.Errorf("Topics: got %v, want [events]", stats.Topics)
+	}
+	if len(stats.Assignment) != 2 {
+		t.Errorf("Assignment: got %d, want 2", len(stats.Assignment))
+	}
+	if stats.PolledCount != 5 {
+		t.Errorf("PolledCount: got %d, want 5", stats.PolledCount)
+	}
+	if stats.PerPartition[p0] != 3 {
+		t.Errorf("PerPartition[p0]: got %d, want 3 (Position post-drain)", stats.PerPartition[p0])
+	}
+	if stats.PerPartition[p1] != 2 {
+		t.Errorf("PerPartition[p1]: got %d, want 2", stats.PerPartition[p1])
+	}
+}
+
+// TestConsumer_WithAutoCommit_PersistsPositionPeriodically proves
+// a group consumer configured with WithAutoCommit ticks a
+// background goroutine that calls CommitAll every interval, so the
+// broker-side committed offset advances without manual Commit
+// calls. Closes the gap where SDK consumers outside the streams /
+// connect wrappers had to roll their own auto-commit.
+func TestConsumer_WithAutoCommit_PersistsPositionPeriodically(t *testing.T) {
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport(),
+		sdk.WithGroup("g"),
+		sdk.WithAutoCommit(50*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Subscribe(ctx, "events", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Produce 3 records, drain, wait for auto-commit tick.
+	for i := 0; i < 3; i++ {
+		if _, err := prod.Send(ctx, "events", proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = drainAtLeast(t, ctx, c, 3)
+
+	// Wait for at least one auto-commit tick (50ms × 3 to give margin).
+	time.Sleep(200 * time.Millisecond)
+
+	// Assert — broker has committed offset 3 (next-to-read).
+	tr, err := holocronnet.Dial(addrFromBroker(t, b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	entries, err := tr.ListGroupOffsets(ctx, "g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("offsets: got %d entries, want 1", len(entries))
+	}
+	if entries[0].Committed != 3 {
+		t.Errorf("committed: got %d, want 3 (auto-commit didn't fire)", entries[0].Committed)
+	}
+}
+
+// TestConsumer_PauseAll_StopsEveryPartition proves PauseAll cancels
+// every active pump in one call and ResumeAll restarts them. Sister
+// to per-partition Pause/Resume for the common "halt the whole
+// consumer for backpressure, then catch up" pattern.
+func TestConsumer_PauseAll_StopsEveryPartition(t *testing.T) {
+	// Arrange — two-partition topic with a self-managed consumer.
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p0 := proto.PartitionRef{Topic: "events", Index: 0}
+	p1 := proto.PartitionRef{Topic: "events", Index: 1}
+	if err := c.Assign(ctx, p0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Assign(ctx, p1, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-prime — produce one record on each partition and drain.
+	if _, err := b.Transport().Publish(ctx, p0, proto.Record{Value: []byte("p0-r0")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Transport().Publish(ctx, p1, proto.Record{Value: []byte("p1-r0")}); err != nil {
+		t.Fatal(err)
+	}
+	_ = drainAtLeast(t, ctx, c, 2)
+
+	// Act — pause everything.
+	if err := c.PauseAll(); err != nil {
+		t.Fatalf("PauseAll: %v", err)
+	}
+	// Produce more on each — should NOT arrive while paused.
+	if _, err := b.Transport().Publish(ctx, p0, proto.Record{Value: []byte("paused-p0")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Transport().Publish(ctx, p1, proto.Record{Value: []byte("paused-p1")}); err != nil {
+		t.Fatal(err)
+	}
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	got, _ := c.Poll(pollCtx, 5)
+	pollCancel()
+	if len(got) > 0 {
+		t.Fatalf("paused poll: got %d records, want 0 (PauseAll didn't stop pumps)", len(got))
+	}
+
+	// ResumeAll — both partitions should now deliver.
+	if err := c.ResumeAll(ctx, 0); err != nil {
+		t.Fatalf("ResumeAll: %v", err)
+	}
+	got = drainAtLeast(t, ctx, c, 2)
+	if len(got) < 2 {
+		t.Fatalf("post-ResumeAll drain: got %d, want >= 2", len(got))
+	}
+	values := map[string]bool{}
+	for _, r := range got {
+		values[string(r.Value)] = true
+	}
+	if !values["paused-p0"] || !values["paused-p1"] {
+		t.Errorf("ResumeAll missed records: got values=%v", values)
+	}
+}
+
+// TestConsumer_TotalLag_SumsAcrossPartitions proves TotalLag
+// aggregates per-partition lag across every partition the consumer
+// is actively pumping. One number — "is this consumer keeping up?"
+// — without the caller having to enumerate partitions and sum
+// manually.
+func TestConsumer_TotalLag_SumsAcrossPartitions(t *testing.T) {
+	// Arrange — two-partition topic so TotalLag has more than
+	// one partition to aggregate.
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p0 := proto.PartitionRef{Topic: "events", Index: 0}
+	p1 := proto.PartitionRef{Topic: "events", Index: 1}
+	if err := c.Assign(ctx, p0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Assign(ctx, p1, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Send 3 records to partition 0 and 2 to partition 1 by
+	// directly publishing to the partition (bypasses the
+	// partitioner).
+	for i := 0; i < 3; i++ {
+		if _, err := b.Transport().Publish(ctx, p0, proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := b.Transport().Publish(ctx, p1, proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Act — without polling, TotalLag should be 5 (3 + 2).
+	lag, err := c.TotalLag(ctx)
+	if err != nil {
+		t.Fatalf("TotalLag: %v", err)
+	}
+	if lag != 5 {
+		t.Errorf("TotalLag before any poll: got %d, want 5", lag)
+	}
+
+	// Drain everything; TotalLag should drop to 0.
+	_ = drainAtLeast(t, ctx, c, 5)
+	lag, err = c.TotalLag(ctx)
+	if err != nil {
+		t.Fatalf("TotalLag after drain: %v", err)
+	}
+	if lag != 0 {
+		t.Errorf("TotalLag after full drain: got %d, want 0", lag)
+	}
+}
+
+// TestConsumer_PositionAndLag proves Position returns the next-to-
+// read offset for an assigned partition (latest+1, or 0 when nothing
+// has been read yet) and Lag returns high-water - position. Both
+// answer "where am I and how far behind am I?" for self-managed
+// Consumers — group-coordinated consumers commit through the
+// broker, but a self-managed consumer using Assign/Subscribe has no
+// other introspection path.
+func TestConsumer_PositionAndLag(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p := proto.PartitionRef{Topic: "events", Index: 0}
+	if err := c.Assign(ctx, p, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Produce 5 records — high-water = 5.
+	for i := 0; i < 5; i++ {
+		if _, err := prod.Send(ctx, "events", proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Read just two; Position should be 2 (next-to-read), Lag should be 3.
+	got := drainAtLeast(t, ctx, c, 2)
+	if len(got) < 2 {
+		t.Fatalf("first drain: got %d, want >= 2", len(got))
+	}
+
+	pos, ok := c.Position(p)
+	if !ok {
+		t.Fatal("Position: ok=false after reading 2 records")
+	}
+	if pos != 2 {
+		t.Errorf("Position after 2 reads: got %d, want 2", pos)
+	}
+
+	lag, err := c.Lag(ctx, p)
+	if err != nil {
+		t.Fatalf("Lag: %v", err)
+	}
+	if lag != 3 {
+		t.Errorf("Lag after 2 reads of 5: got %d, want 3", lag)
+	}
+}
+
+// TestConsumer_SeekToEnd_AttachesAtHighWater proves SeekToEnd
+// repositions the consumer to the partition's current high-water,
+// so subsequent records produced after the call are observed but
+// pre-existing records are skipped. The live-tail-from-here
+// pattern in one call.
+func TestConsumer_SeekToEnd_AttachesAtHighWater(t *testing.T) {
+	// Arrange — pre-seed 3 records before SeekToEnd.
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p := proto.PartitionRef{Topic: "events", Index: 0}
+	if err := c.Assign(ctx, p, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"old1", "old2", "old3"} {
+		if _, err := prod.Send(ctx, "events", proto.Record{Value: []byte(v)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Act — seek past the historical records.
+	if err := c.SeekToEnd(ctx, p); err != nil {
+		t.Fatalf("SeekToEnd: %v", err)
+	}
+
+	// Produce one record AFTER the seek. Only this should arrive.
+	if _, err := prod.Send(ctx, "events", proto.Record{Value: []byte("new1")}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := drainAtLeast(t, ctx, c, 1)
+	if len(got) < 1 {
+		t.Fatalf("post-seek read: got %d, want >= 1", len(got))
+	}
+	if string(got[0].Value) != "new1" {
+		t.Errorf("first post-seek record: got %q, want new1", got[0].Value)
+	}
+}
+
+// TestConsumer_SeekToBeginning_RewindsToZero proves SeekToBeginning
+// is sugar for Seek(p, 0) — the partition's pump restarts at offset
+// 0 and re-delivers historical records.
+func TestConsumer_SeekToBeginning_RewindsToZero(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p := proto.PartitionRef{Topic: "events", Index: 0}
+	if err := c.Assign(ctx, p, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, v := range []string{"a", "b", "c"} {
+		if _, err := prod.Send(ctx, "events", proto.Record{Value: []byte(v)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Drain everything once.
+	_ = drainAtLeast(t, ctx, c, 3)
+
+	// Act
+	if err := c.SeekToBeginning(ctx, p); err != nil {
+		t.Fatalf("SeekToBeginning: %v", err)
+	}
+
+	// Assert — all 3 records re-arrive.
+	got := drainAtLeast(t, ctx, c, 3)
+	if len(got) < 3 || string(got[0].Value) != "a" {
+		t.Fatalf("post-rewind: got %d records (first=%q), want >= 3 starting at 'a'", len(got), got[0].Value)
+	}
+}
+
+// TestConsumer_SeekRewindsToOffset proves Seek repositions an
+// already-assigned partition's pump to a fresh offset mid-session.
+// After consuming the first of three records, a Seek back to offset
+// 0 makes the next Poll surface offset 0 again — the same record
+// is re-delivered without leaving the assignment or restarting the
+// Consumer.
+//
+// Without Seek the only way to replay a record is to construct a
+// fresh Consumer and Assign at the desired offset, which loses
+// other assigned partitions and any in-flight buffer state.
+func TestConsumer_SeekRewindsToOffset(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p := proto.PartitionRef{Topic: "events", Index: 0}
+	if err := c.Assign(ctx, p, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Produce three records — offsets 0,1,2.
+	for _, v := range []string{"v0", "v1", "v2"} {
+		if _, err := prod.Send(ctx, "events", proto.Record{Value: []byte(v)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Read all three through the initial pump.
+	first := drainAtLeast(t, ctx, c, 3)
+	if len(first) != 3 || string(first[0].Value) != "v0" {
+		t.Fatalf("first read: got %d records (first=%q), want 3 starting at v0", len(first), first[0].Value)
+	}
+
+	// Act — seek back to offset 0.
+	if err := c.Seek(ctx, p, 0); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+
+	// Assert — the next reads see the same three records again,
+	// starting at v0. drainAtLeast will block until 3 arrive or ctx
+	// expires.
+	again := drainAtLeast(t, ctx, c, 3)
+	if len(again) < 3 {
+		t.Fatalf("post-seek read: got %d records, want >= 3", len(again))
+	}
+	for i, want := range []string{"v0", "v1", "v2"} {
+		if string(again[i].Value) != want {
+			t.Errorf("post-seek record %d: got %q, want %q", i, again[i].Value, want)
+		}
+	}
+}
+
+// drainAtLeast Poll-loops until at least want records have arrived
+// or ctx expires.
+func drainAtLeast(t *testing.T, ctx context.Context, c *sdk.Consumer, want int) []proto.Record {
+	t.Helper()
+	out := make([]proto.Record, 0, want)
+	for len(out) < want {
+		recs, err := c.Poll(ctx, want-len(out))
+		if err != nil {
+			t.Fatalf("Poll: %v", err)
+		}
+		out = append(out, recs...)
+	}
+	return out
 }
 
 // TestProducer_IdempotentDedupSurvivesBrokerRestart proves the

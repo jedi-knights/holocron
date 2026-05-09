@@ -125,7 +125,7 @@ func (b *batcher) flushNow(ctx context.Context) error {
 	if err != nil {
 		for _, ch := range results {
 			if ch == nil {
-				b.producer.recordAsyncError()
+				b.producer.recordAsyncError(b.pref, err)
 				continue
 			}
 			ch <- batchResult{err: err}
@@ -136,7 +136,7 @@ func (b *batcher) flushNow(ctx context.Context) error {
 		if syncErr := b.producer.transport.Sync(ctx, b.pref); syncErr != nil {
 			for _, ch := range results {
 				if ch == nil {
-					b.producer.recordAsyncError()
+					b.producer.recordAsyncError(b.pref, syncErr)
 					continue
 				}
 				ch <- batchResult{err: syncErr}
@@ -144,6 +144,7 @@ func (b *batcher) flushNow(ctx context.Context) error {
 			return syncErr
 		}
 	}
+	b.producer.sendCount.Add(int64(len(pending)))
 	for i, ch := range results {
 		if ch == nil {
 			continue // no-wait record; nothing to signal
@@ -167,12 +168,13 @@ func (b *batcher) shutdown() {
 		b.timer.Stop()
 		b.timer = nil
 	}
+	closedErr := errors.New("sdk: producer closed")
 	for _, ch := range b.results {
 		if ch == nil {
-			b.producer.recordAsyncError()
+			b.producer.recordAsyncError(b.pref, closedErr)
 			continue
 		}
-		ch <- batchResult{err: errors.New("sdk: producer closed")}
+		ch <- batchResult{err: closedErr}
 	}
 	b.pending = nil
 	b.results = nil

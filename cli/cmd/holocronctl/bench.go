@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/jedi-knights/holocron/proto"
@@ -30,6 +31,7 @@ func runBench(args []string) error {
 	size := fs.Int("size", 256, "record value size in bytes (produce mode)")
 	linger := fs.Duration("linger", 0, "producer linger window (0 = no batching)")
 	batchSize := fs.Int("batch-size", 256, "producer batch size cap")
+	producerCount := fs.Int("producer-count", 1, "number of concurrent Producers (--count is split across them)")
 	consume := fs.Bool("consume", false, "consume mode: read N records and measure the fetch path")
 	fromOffset := fs.Int64("from-offset", 0, "consume mode: starting offset")
 	pollSize := fs.Int("poll-size", 256, "consume mode: max records per Poll call")
@@ -46,6 +48,9 @@ func runBench(args []string) error {
 	if !*consume && *size <= 0 {
 		return errors.New("bench: --size must be > 0 in produce mode")
 	}
+	if *producerCount <= 0 {
+		return errors.New("bench: --producer-count must be > 0")
+	}
 
 	tr, err := dial(*addr, *apiKey)
 	if err != nil {
@@ -59,16 +64,6 @@ func runBench(args []string) error {
 		return runBenchConsume(ctx, tr, *topic, *count, *fromOffset, *pollSize)
 	}
 
-	prodOpts := []sdk.ProducerOption{sdk.WithBatchSize(*batchSize)}
-	if *linger > 0 {
-		prodOpts = append(prodOpts, sdk.WithLinger(*linger))
-	}
-	prod, err := sdk.NewProducer(tr, prodOpts...)
-	if err != nil {
-		return err
-	}
-	defer prod.Close()
-
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
@@ -77,22 +72,72 @@ func runBench(args []string) error {
 		value[i] = byte('a' + (i % 26))
 	}
 
-	// Each Send is timed individually so we can report the
-	// distribution. With linger enabled, latency reflects "time to
-	// flush + ack" rather than "time on the wire."
-	latencies := make([]time.Duration, 0, *count)
+	// Split count across producers. The remainder lands on the
+	// last producer so the grand total equals --count exactly.
+	perProducer := *count / *producerCount
+	remainder := *count % *producerCount
+
+	prodOpts := []sdk.ProducerOption{sdk.WithBatchSize(*batchSize)}
+	if *linger > 0 {
+		prodOpts = append(prodOpts, sdk.WithLinger(*linger))
+	}
+
+	type producerResult struct {
+		latencies []time.Duration
+		err       error
+	}
+	results := make([]producerResult, *producerCount)
+	var wg sync.WaitGroup
+	wg.Add(*producerCount)
 	start := time.Now()
-	for i := 0; i < *count; i++ {
-		t0 := time.Now()
-		if _, err := prod.Send(ctx, *topic, proto.Record{Value: value}); err != nil {
-			return fmt.Errorf("bench send %d: %w", i, err)
+	for i := 0; i < *producerCount; i++ {
+		myCount := perProducer
+		if i == *producerCount-1 {
+			myCount += remainder
 		}
-		latencies = append(latencies, time.Since(t0))
+		go func(idx, recs int) {
+			defer wg.Done()
+			// Each producer dials its own connection so the
+			// concurrent load actually parallelizes on the wire
+			// rather than serializing through one socket.
+			myTr, err := dial(*addr, *apiKey)
+			if err != nil {
+				results[idx] = producerResult{err: fmt.Errorf("producer %d dial: %w", idx, err)}
+				return
+			}
+			defer myTr.Close()
+			prod, err := sdk.NewProducer(myTr, prodOpts...)
+			if err != nil {
+				results[idx] = producerResult{err: fmt.Errorf("producer %d new: %w", idx, err)}
+				return
+			}
+			defer prod.Close()
+			lats := make([]time.Duration, 0, recs)
+			for j := 0; j < recs; j++ {
+				t0 := time.Now()
+				if _, err := prod.Send(ctx, *topic, proto.Record{Value: value}); err != nil {
+					results[idx] = producerResult{latencies: lats, err: fmt.Errorf("producer %d send %d: %w", idx, j, err)}
+					return
+				}
+				lats = append(lats, time.Since(t0))
+			}
+			if err := prod.Flush(ctx); err != nil {
+				results[idx] = producerResult{latencies: lats, err: fmt.Errorf("producer %d flush: %w", idx, err)}
+				return
+			}
+			results[idx] = producerResult{latencies: lats}
+		}(i, myCount)
 	}
-	if err := prod.Flush(ctx); err != nil {
-		return fmt.Errorf("bench final flush: %w", err)
-	}
+	wg.Wait()
 	elapsed := time.Since(start)
+
+	latencies := make([]time.Duration, 0, *count)
+	for _, r := range results {
+		if r.err != nil {
+			return r.err
+		}
+		latencies = append(latencies, r.latencies...)
+	}
 
 	totalBytes := int64(*count) * int64(*size)
 	rps := float64(*count) / elapsed.Seconds()
@@ -105,6 +150,7 @@ func runBench(args []string) error {
 	}
 
 	fmt.Printf("records:    %d\n", *count)
+	fmt.Printf("producers:  %d\n", *producerCount)
 	fmt.Printf("size/rec:   %d bytes\n", *size)
 	fmt.Printf("elapsed:    %v\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("throughput: %.0f records/sec, %.2f MB/sec\n", rps, mbps)

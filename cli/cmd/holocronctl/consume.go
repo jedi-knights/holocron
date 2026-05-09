@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/jedi-knights/holocron/proto"
@@ -26,6 +28,7 @@ func runTail(args []string) error {
 	topic := fs.String("topic", "", "topic to tail (required)")
 	partition := fs.Int("partition", 0, "partition index")
 	max := fs.Int("max", 0, "stop after N records (0 = run until --duration elapses)")
+	jsonOut := fs.Bool("json", false, "emit each record as JSONL (same shape as topic dump)")
 	duration := fs.Duration("duration", 30*time.Second, "max time to wait")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -61,6 +64,7 @@ func runTail(args []string) error {
 		return fmt.Errorf("assign at high-water %d: %w", hw, err)
 	}
 
+	enc := json.NewEncoder(os.Stdout)
 	count := 0
 	for {
 		batchSize := 32
@@ -75,14 +79,22 @@ func runTail(args []string) error {
 			return err
 		}
 		for _, r := range records {
-			fmt.Printf("offset=%d key=%q value=%q\n", r.Offset, r.Key, r.Value)
+			if *jsonOut {
+				if err := enc.Encode(toDumpRecord(r)); err != nil {
+					return fmt.Errorf("encode offset %d: %w", r.Offset, err)
+				}
+			} else {
+				fmt.Printf("offset=%d key=%q value=%q\n", r.Offset, r.Key, r.Value)
+			}
 			count++
 			if *max > 0 && count >= *max {
 				return nil
 			}
 		}
 	}
-	fmt.Printf("tailed %d record(s) from offset %d\n", count, hw)
+	if !*jsonOut {
+		fmt.Printf("tailed %d record(s) from offset %d\n", count, hw)
+	}
 	return nil
 }
 
@@ -93,6 +105,7 @@ func runConsume(args []string) error {
 	topic := fs.String("topic", "", "source topic (required)")
 	fromOffset := fs.Int64("from-offset", 0, "starting offset")
 	max := fs.Int("max", 0, "stop after N records (0 = run until --duration elapses or ctrl-c)")
+	jsonOut := fs.Bool("json", false, "emit each record as JSONL (same shape as topic dump)")
 	duration := fs.Duration("duration", 10*time.Second, "max time to wait")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -119,6 +132,7 @@ func runConsume(args []string) error {
 		return fmt.Errorf("subscribe: %w", err)
 	}
 
+	enc := json.NewEncoder(os.Stdout)
 	count := 0
 	for {
 		batchSize := 32
@@ -133,13 +147,21 @@ func runConsume(args []string) error {
 			return err
 		}
 		for _, r := range records {
-			fmt.Printf("offset=%d key=%q value=%q\n", r.Offset, r.Key, r.Value)
+			if *jsonOut {
+				if err := enc.Encode(toDumpRecord(r)); err != nil {
+					return fmt.Errorf("encode offset %d: %w", r.Offset, err)
+				}
+			} else {
+				fmt.Printf("offset=%d key=%q value=%q\n", r.Offset, r.Key, r.Value)
+			}
 			count++
 			if *max > 0 && count >= *max {
 				return nil
 			}
 		}
 	}
-	fmt.Printf("read %d record(s)\n", count)
+	if !*jsonOut {
+		fmt.Printf("read %d record(s)\n", count)
+	}
 	return nil
 }

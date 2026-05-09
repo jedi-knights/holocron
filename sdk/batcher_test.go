@@ -2,6 +2,7 @@ package sdk_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,19 @@ type recordingTransport struct {
 	batchCalls     int32
 	batchSizes     []int
 	partitionsForN int32
+	// failPublish/failBatch cause the corresponding wire path to
+	// return an error — used to exercise async-error handling.
+	failPublish bool
+	failBatch   bool
+	// publishHook, when set, is called on every Publish — used by
+	// the MaxInFlight test to hold publishes in-flight on a
+	// release channel.
+	publishHook func()
+	// publishStatuses queues a sequence of ProtocolError statuses
+	// to return on successive Publish calls. Used by retry tests
+	// to simulate transient errors that succeed after N attempts.
+	publishStatuses []proto.Status
+	statusIdx       int32
 }
 
 func newRecordingTransport(partitions int32) *recordingTransport {
@@ -28,6 +42,19 @@ func newRecordingTransport(partitions int32) *recordingTransport {
 
 func (t *recordingTransport) Publish(_ context.Context, _ proto.PartitionRef, _ proto.Record) (int64, error) {
 	atomic.AddInt32(&t.publishCalls, 1)
+	if t.publishHook != nil {
+		t.publishHook()
+	}
+	if t.failPublish {
+		return 0, errBatchTransportFailed
+	}
+	// Walk publishStatuses for the retry test: return a
+	// ProtocolError carrying each queued status until exhausted,
+	// then return success.
+	idx := atomic.AddInt32(&t.statusIdx, 1) - 1
+	if int(idx) < len(t.publishStatuses) {
+		return 0, &proto.ProtocolError{Status: t.publishStatuses[idx], Message: "simulated"}
+	}
 	return 0, nil
 }
 
@@ -36,8 +63,13 @@ func (t *recordingTransport) PublishBatch(_ context.Context, _ proto.PartitionRe
 	t.mu.Lock()
 	t.batchSizes = append(t.batchSizes, len(records))
 	t.mu.Unlock()
+	if t.failBatch {
+		return 0, errBatchTransportFailed
+	}
 	return 0, nil
 }
+
+var errBatchTransportFailed = errors.New("transport intentionally failed")
 
 func (t *recordingTransport) Subscribe(_ context.Context, _ proto.PartitionRef, _ int64) (<-chan proto.Record, <-chan error, error) {
 	return nil, nil, nil
@@ -207,6 +239,355 @@ func TestProducer_SendNoWait_ReturnsBeforeFlush(t *testing.T) {
 	}
 	if errs := p.AsyncErrors(); errs != 0 {
 		t.Errorf("AsyncErrors: got %d, want 0 (no failures)", errs)
+	}
+}
+
+// TestProducer_MaxInFlight_BlocksOverCap proves WithMaxInFlight(n)
+// caps SendNoWait outstanding goroutines at n: the (n+1)th
+// SendNoWait blocks until an in-flight publish completes.
+//
+// Bounds memory under fire-and-forget bursts where unconstrained
+// SendNoWait would otherwise spawn an unbounded number of
+// goroutines. The semantic is "block when cap is reached" — the
+// caller's Send-rate is implicitly throttled by the wire.
+func TestProducer_MaxInFlight_BlocksOverCap(t *testing.T) {
+	// Arrange — a transport whose Publish blocks on a release
+	// channel so we can hold goroutines in-flight deterministically.
+	tr := newRecordingTransport(1)
+	release := make(chan struct{})
+	tr.publishHook = func() {
+		<-release // block until the test signals
+	}
+	p, err := sdk.NewProducer(tr,
+		sdk.WithMaxInFlight(2),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// Act — fire 2 SendNoWaits; both should return immediately
+	// (slots 1 and 2 of 2). Then a 3rd in a goroutine; it should
+	// block until we release.
+	for i := 0; i < 2; i++ {
+		if err := p.SendNoWait(context.Background(), "t", proto.Record{Value: []byte("v")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	thirdReturned := make(chan struct{})
+	go func() {
+		_ = p.SendNoWait(context.Background(), "t", proto.Record{Value: []byte("v")})
+		close(thirdReturned)
+	}()
+
+	// 3rd should NOT have returned yet (no slot available).
+	select {
+	case <-thirdReturned:
+		t.Fatal("3rd SendNoWait returned while 2 in-flight (cap not enforced)")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Release one in-flight; the 3rd should now acquire a slot
+	// and return.
+	release <- struct{}{}
+	select {
+	case <-thirdReturned:
+	case <-time.After(time.Second):
+		t.Fatal("3rd SendNoWait still blocked after release")
+	}
+
+	// Drain the remaining in-flight goroutines so Close doesn't
+	// leak; SendNoWait fired 3 publishes total.
+	close(release)
+}
+
+// TestProducer_WithRetryOn_RetriesConfiguredStatuses proves
+// WithRetryOn extends retry beyond the built-in StatusRateLimited
+// to any user-specified status. Useful for transient errors like
+// StatusNotLeader during a leadership change — without retry on
+// that status, every Send during the failover window fails.
+func TestProducer_WithRetryOn_RetriesConfiguredStatuses(t *testing.T) {
+	tr := newRecordingTransport(1)
+	// First two calls return StatusInternal; third succeeds.
+	var calls atomic.Int32
+	tr.publishHook = func() {
+		c := calls.Add(1)
+		if c <= 2 {
+			panic("simulated transient") // panic propagates as Publish error via recordingTransport... actually it doesn't
+		}
+	}
+	// Replace publishHook with status-based failure.
+	calls.Store(0)
+	tr.publishHook = nil
+	tr.publishStatuses = []proto.Status{proto.StatusInternal, proto.StatusInternal}
+
+	p, err := sdk.NewProducer(tr,
+		sdk.WithRetryOn(proto.StatusInternal),
+		sdk.WithRateLimitRetry(3, time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// Act
+	_, err = p.Send(context.Background(), "t", proto.Record{Value: []byte("v")})
+	if err != nil {
+		t.Fatalf("Send: got %v, want success after retries", err)
+	}
+
+	// Assert — exactly 3 attempts (2 failures + success).
+	if got := atomic.LoadInt32(&tr.publishCalls); got != 3 {
+		t.Errorf("publish call count: got %d, want 3 (2 fails + 1 success)", got)
+	}
+}
+
+// TestProducer_Stats_AggregatesObservability proves Stats() returns
+// a single snapshot covering SendCount, AsyncErrors, Pending, and
+// BatcherCount — the observability fields a monitoring caller
+// wants in one call rather than four method invocations across the
+// hot path.
+func TestProducer_Stats_AggregatesObservability(t *testing.T) {
+	tr := newRecordingTransport(2)
+	p, err := sdk.NewProducer(tr,
+		sdk.WithLinger(10*time.Second),
+		sdk.WithBatchSize(100),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// Prime two partitions so BatcherCount = 2.
+	if err := p.SendNoWait(context.Background(), "a", proto.Record{Value: []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SendNoWait(context.Background(), "b", proto.Record{Value: []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+	// Add a third record to one partition for Pending=3.
+	if err := p.SendNoWait(context.Background(), "a", proto.Record{Value: []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := p.Stats()
+	if stats.Pending != 3 {
+		t.Errorf("Pending: got %d, want 3", stats.Pending)
+	}
+	if stats.BatcherCount != 2 {
+		t.Errorf("BatcherCount: got %d, want 2 (two distinct partitions)", stats.BatcherCount)
+	}
+	if stats.SendCount != 0 {
+		t.Errorf("SendCount: got %d, want 0 (still in linger window)", stats.SendCount)
+	}
+	if stats.AsyncErrors != 0 {
+		t.Errorf("AsyncErrors: got %d, want 0", stats.AsyncErrors)
+	}
+
+	// Flush — pending drains, SendCount catches up.
+	if err := p.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stats = p.Stats()
+	if stats.Pending != 0 {
+		t.Errorf("post-flush Pending: got %d, want 0", stats.Pending)
+	}
+	if stats.SendCount != 3 {
+		t.Errorf("post-flush SendCount: got %d, want 3", stats.SendCount)
+	}
+}
+
+// TestProducer_SendCount_TotalsSuccessfulRecords proves SendCount
+// reports the cumulative number of records the producer has
+// successfully sent across Send / SendBatch / SendNoWait. Pairs
+// with AsyncErrors() and PendingCount() for the full producer
+// health snapshot.
+func TestProducer_SendCount_TotalsSuccessfulRecords(t *testing.T) {
+	tr := newRecordingTransport(1)
+	p, err := sdk.NewProducer(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	if got := p.SendCount(); got != 0 {
+		t.Fatalf("initial SendCount: got %d, want 0", got)
+	}
+
+	// 3 single sends + 1 batch of 4 = 7 records.
+	for range 3 {
+		if _, err := p.Send(context.Background(), "t", proto.Record{Value: []byte("v")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch := make([]proto.Record, 4)
+	for i := range batch {
+		batch[i] = proto.Record{Value: []byte("b")}
+	}
+	if _, err := p.SendBatch(context.Background(), "t", batch); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := p.SendCount(); got != 7 {
+		t.Errorf("post-7-sends SendCount: got %d, want 7", got)
+	}
+}
+
+// TestProducer_PendingCount_TracksBatcherDepth proves PendingCount
+// reports the total records currently sitting in per-partition
+// batchers, summed across partitions. Backpressure-aware callers
+// can use it to throttle producers when the wire is saturated.
+//
+// With a long linger, three SendNoWaits sit in the batcher and
+// PendingCount returns 3; after Flush the batcher drains and
+// PendingCount drops to 0.
+func TestProducer_PendingCount_TracksBatcherDepth(t *testing.T) {
+	// Arrange — long linger so records linger.
+	tr := newRecordingTransport(1)
+	p, err := sdk.NewProducer(tr,
+		sdk.WithLinger(10*time.Second),
+		sdk.WithBatchSize(100),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// Initially zero.
+	if got := p.PendingCount(); got != 0 {
+		t.Fatalf("initial PendingCount: got %d, want 0", got)
+	}
+
+	// Three fire-and-forget sends — they sit in the batcher.
+	for range 3 {
+		if err := p.SendNoWait(context.Background(), "t", proto.Record{Value: []byte("v")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := p.PendingCount(); got != 3 {
+		t.Errorf("PendingCount after 3 SendNoWait: got %d, want 3", got)
+	}
+
+	// Flush drains the batcher.
+	if err := p.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.PendingCount(); got != 0 {
+		t.Errorf("PendingCount after Flush: got %d, want 0", got)
+	}
+}
+
+// TestProducer_OnAsyncError_FiresOnNoLingerFailure proves the
+// OnAsyncError hook fires once per failed SendNoWait when linger is
+// disabled — the no-linger path uses transport.Publish under a
+// background goroutine, and a Publish failure that previously only
+// surfaced through the AsyncErrors counter now also reaches the
+// callback. Without the callback an operator must poll
+// AsyncErrors() to detect failures; with it, alerts can fire on the
+// failing record's partition immediately.
+func TestProducer_OnAsyncError_FiresOnNoLingerFailure(t *testing.T) {
+	// Arrange — transport returns an error from Publish.
+	tr := newRecordingTransport(1)
+	tr.failPublish = true
+	var (
+		mu     sync.Mutex
+		got    []proto.PartitionRef
+		gotErr []error
+	)
+	p, err := sdk.NewProducer(tr,
+		sdk.WithOnAsyncError(func(pref proto.PartitionRef, err error) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, pref)
+			gotErr = append(gotErr, err)
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// Act — three fire-and-forget sends, all expected to fail.
+	for range 3 {
+		if err := p.SendNoWait(context.Background(), "t", proto.Record{Value: []byte("v")}); err != nil {
+			t.Fatalf("SendNoWait: %v", err)
+		}
+	}
+
+	// SendNoWait fires a goroutine for each record (no linger);
+	// give them time to land. The hook fires synchronously on the
+	// publish goroutine after the failure.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Assert — three callback fires, each with the failure error.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("OnAsyncError fires: got %d, want 3 (gotErr=%v)", len(got), gotErr)
+	}
+	for i, e := range gotErr {
+		if !errors.Is(e, errBatchTransportFailed) {
+			t.Errorf("fire %d error: got %v, want errBatchTransportFailed", i, e)
+		}
+	}
+	if asyncErrs := p.AsyncErrors(); asyncErrs != 3 {
+		t.Errorf("AsyncErrors counter: got %d, want 3 (counter still bumps alongside the hook)", asyncErrs)
+	}
+}
+
+// TestProducer_OnAsyncError_FiresOnLingerFlushFailure proves the
+// hook also fires on the linger-batched flush path: with a long
+// linger, three SendNoWaits accumulate, Flush triggers a single
+// batched publish, and the failed batch fires the hook once per
+// no-wait record in the batch. Without per-record granularity here
+// the operator can't tell how many fire-and-forget records were
+// affected by a single batch failure.
+func TestProducer_OnAsyncError_FiresOnLingerFlushFailure(t *testing.T) {
+	// Arrange
+	tr := newRecordingTransport(1)
+	tr.failBatch = true
+	var (
+		mu  sync.Mutex
+		got int
+	)
+	p, err := sdk.NewProducer(tr,
+		sdk.WithLinger(10*time.Second),
+		sdk.WithBatchSize(100),
+		sdk.WithOnAsyncError(func(_ proto.PartitionRef, _ error) {
+			mu.Lock()
+			defer mu.Unlock()
+			got++
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// Act — three SendNoWaits sit in the batcher.
+	for range 3 {
+		if err := p.SendNoWait(context.Background(), "t", proto.Record{Value: []byte("v")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Flush triggers the batch publish, which fails — three
+	// no-wait records → three callback fires.
+	_ = p.Flush(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got != 3 {
+		t.Fatalf("OnAsyncError fires: got %d, want 3", got)
 	}
 }
 

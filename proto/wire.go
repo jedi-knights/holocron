@@ -38,7 +38,14 @@ var wireCRCTable = crc32.MakeTable(crc32.Castagnoli)
 //	    on a single response, and the donor's active segment is
 //	    safely included in the snapshot via byte-range reads bounded
 //	    by the size captured at list time.
-const WireVersion uint8 = 7
+//	v8: ListGroupOffsets — operator-facing enumeration of a
+//	    consumer group's committed offsets paired with each
+//	    partition's high-water so an operator-side tool can compute
+//	    lag in one round-trip.
+//	v9: DeleteGroup — operator-driven removal of a group and
+//	    every committed offset under it. Pairs with the cleanup
+//	    workflow surfaced by `holocronctl group delete`.
+const WireVersion uint8 = 9
 
 // OpCode names a request type. Responses echo the same opcode.
 type OpCode uint8
@@ -95,6 +102,17 @@ const (
 	// (changing it would break ordering invariants); only soft
 	// configuration knobs are updatable.
 	OpUpdateTopicConfig OpCode = 0x17
+	// OpListGroupOffsets returns every (topic, partition, committed,
+	// high-water) tuple a group has touched. The lag column is
+	// computed by the caller (high-water - committed); the broker
+	// emits the raw pair so the operator can see whether the high
+	// water is what they expected.
+	OpListGroupOffsets OpCode = 0x18
+	// OpDeleteGroup drops a consumer group from the broker's
+	// in-memory registry and clears every committed offset under
+	// that group. Idempotent — a missing group surfaces as
+	// StatusUnknownMember so an operator script can squelch it.
+	OpDeleteGroup OpCode = 0x19
 )
 
 // Status is the first byte of every response body.
@@ -336,6 +354,12 @@ type ProduceBatchRequest struct {
 	Partition int32
 	Codec     Codec
 	Records   []Record
+	// Level is a producer-side encoding hint, not part of the wire
+	// format. 0 picks the fast LZ4 compressor (default); 1..9 use
+	// LZ4-HC at that level for higher compression ratio at the
+	// cost of CPU. The decoder is unaffected — both variants emit
+	// the same on-the-wire format.
+	Level uint8
 }
 
 func (r ProduceBatchRequest) Encode() []byte {
@@ -351,7 +375,7 @@ func (r ProduceBatchRequest) Encode() []byte {
 
 	switch r.Codec {
 	case CodecLZ4:
-		compressed, err := lz4Compress(recordsBuf)
+		compressed, err := lz4CompressLevel(recordsBuf, int(r.Level))
 		if err != nil {
 			// Fall back to uncompressed; document the failure in the
 			// codec byte so the decoder doesn't try to decompress
@@ -1521,6 +1545,99 @@ func DecodeSyncRequest(b []byte) (SyncRequest, error) {
 		Topic:     topic,
 		Partition: int32(binary.BigEndian.Uint32(b[:4])),
 	}, nil
+}
+
+// DeleteGroupRequest names the group to delete. The response body
+// is empty (status-only).
+type DeleteGroupRequest struct {
+	Group string
+}
+
+func (r DeleteGroupRequest) Encode() []byte {
+	return encodeString(nil, r.Group)
+}
+
+func DecodeDeleteGroupRequest(b []byte) (DeleteGroupRequest, error) {
+	g, _, err := decodeString(b)
+	if err != nil {
+		return DeleteGroupRequest{}, err
+	}
+	return DeleteGroupRequest{Group: g}, nil
+}
+
+// ListGroupOffsetsRequest names the group whose committed offsets
+// should be enumerated.
+type ListGroupOffsetsRequest struct {
+	Group string
+}
+
+func (r ListGroupOffsetsRequest) Encode() []byte {
+	return encodeString(nil, r.Group)
+}
+
+func DecodeListGroupOffsetsRequest(b []byte) (ListGroupOffsetsRequest, error) {
+	g, _, err := decodeString(b)
+	if err != nil {
+		return ListGroupOffsetsRequest{}, err
+	}
+	return ListGroupOffsetsRequest{Group: g}, nil
+}
+
+// GroupOffsetEntry pairs a (topic, partition) with the group's
+// committed offset and that partition's current high-water. The
+// operator-side caller derives lag = HighWater - Committed; if
+// Committed is NoOffset the partition has been assigned but never
+// committed — typical for a fresh group that hasn't read anything yet.
+type GroupOffsetEntry struct {
+	Topic     string
+	Partition int32
+	Committed int64
+	HighWater int64
+}
+
+// ListGroupOffsetsResponse carries one entry per (topic, partition)
+// the group has touched. Order is deterministic (sorted by topic, then
+// partition) so CLI output is stable.
+type ListGroupOffsetsResponse struct {
+	Entries []GroupOffsetEntry
+}
+
+func (r ListGroupOffsetsResponse) Encode() []byte {
+	b := binary.BigEndian.AppendUint32(nil, uint32(len(r.Entries)))
+	for _, e := range r.Entries {
+		b = encodeString(b, e.Topic)
+		b = binary.BigEndian.AppendUint32(b, uint32(e.Partition))
+		b = binary.BigEndian.AppendUint64(b, uint64(e.Committed))
+		b = binary.BigEndian.AppendUint64(b, uint64(e.HighWater))
+	}
+	return b
+}
+
+func DecodeListGroupOffsetsResponse(b []byte) (ListGroupOffsetsResponse, error) {
+	if len(b) < 4 {
+		return ListGroupOffsetsResponse{}, errors.New("proto: short ListGroupOffsetsResponse")
+	}
+	count := int(binary.BigEndian.Uint32(b[:4]))
+	b = b[4:]
+	out := make([]GroupOffsetEntry, 0, count)
+	for range count {
+		topic, n, err := decodeString(b)
+		if err != nil {
+			return ListGroupOffsetsResponse{}, err
+		}
+		b = b[n:]
+		if len(b) < 20 {
+			return ListGroupOffsetsResponse{}, errors.New("proto: short ListGroupOffsetsResponse entry")
+		}
+		out = append(out, GroupOffsetEntry{
+			Topic:     topic,
+			Partition: int32(binary.BigEndian.Uint32(b[0:4])),
+			Committed: int64(binary.BigEndian.Uint64(b[4:12])),
+			HighWater: int64(binary.BigEndian.Uint64(b[12:20])),
+		})
+		b = b[20:]
+	}
+	return ListGroupOffsetsResponse{Entries: out}, nil
 }
 
 // LeaveGroupRequest deregisters a member from a group.

@@ -76,6 +76,14 @@ func (s *TopicOffsetStore) replay(ctx context.Context) error {
 			return nil
 		}
 		for _, r := range records {
+			// Nil Value is the tombstone marker emitted by
+			// DeleteGroup; treat it as "drop the entry" so a
+			// deleted group's offsets don't resurface on a
+			// restart-driven replay.
+			if r.Value == nil {
+				delete(s.entries, string(r.Key))
+				continue
+			}
 			s.entries[string(r.Key)] = decodeOffsetValue(r.Value)
 		}
 		cursor = records[len(records)-1].Offset + 1
@@ -105,6 +113,41 @@ func (s *TopicOffsetStore) Lookup(group, topic string, partition int32) (int64, 
 		return v, nil
 	}
 	return NoOffset, nil
+}
+
+// List returns every (topic, partition, offset) entry committed under
+// group. Order is unspecified.
+func (s *TopicOffsetStore) List(group string) []OffsetEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return listEntries(s.entries, group)
+}
+
+// DeleteGroup writes a tombstone record (key = joinKey, Value = nil)
+// for every (group, topic, partition) entry the group owns and drops
+// the entries from the in-memory map. Replay treats nil-value records
+// as deletions so the cleanup survives a broker restart.
+func (s *TopicOffsetStore) DeleteGroup(group string) error {
+	s.mu.Lock()
+	keys := make([][]byte, 0)
+	for k := range s.entries {
+		if g, _, _ := splitKey(k); g == group {
+			keys = append(keys, []byte(k))
+		}
+	}
+	s.mu.Unlock()
+	for _, k := range keys {
+		rec := proto.Record{Key: k, Value: nil}
+		if _, err := s.appender.Append(context.Background(), s.pref, rec); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	for _, k := range keys {
+		delete(s.entries, string(k))
+	}
+	s.mu.Unlock()
+	return nil
 }
 
 // Close is a no-op — the appender outlives the store.

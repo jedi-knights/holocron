@@ -415,9 +415,49 @@ func (m *Manager) Describe(groupName string) (GroupDetails, error) {
 	}, nil
 }
 
+// Delete drops the named group from the registry and clears every
+// committed offset under it. Live members are evicted (their next
+// heartbeat returns RebalanceNeeded so they fail fast); a fresh
+// rejoin from the same name starts at generation 0 with no
+// historical offsets.
+//
+// Use to clean up abandoned groups whose members are gone but whose
+// committed offsets still pin retention. ErrUnknownGroup is
+// returned only if the group has no in-memory registration AND no
+// committed offsets — i.e., the name is genuinely unknown.
+func (m *Manager) Delete(groupName string) error {
+	m.mu.Lock()
+	_, hadGroup := m.groups[groupName]
+	if hadGroup {
+		delete(m.groups, groupName)
+	}
+	m.mu.Unlock()
+	hadOffsets := len(m.offsets.List(groupName)) > 0
+	if !hadGroup && !hadOffsets {
+		return ErrUnknownGroup
+	}
+	return m.offsets.DeleteGroup(groupName)
+}
+
 // Commit records a committed offset for (group, partition).
 func (m *Manager) Commit(groupName, topic string, partition int32, offset int64) error {
 	return m.offsets.Commit(groupName, topic, partition, offset)
+}
+
+// ListOffsets enumerates every (topic, partition, offset) tuple
+// committed under groupName. The HighWater field of each entry is
+// left at NoOffset; callers that want lag fill it in by looking up
+// the broker's high-water for each partition. Order is sorted by
+// (topic, partition) so output is deterministic.
+func (m *Manager) ListOffsets(groupName string) []OffsetEntry {
+	entries := m.offsets.List(groupName)
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Topic != entries[j].Topic {
+			return entries[i].Topic < entries[j].Topic
+		}
+		return entries[i].Partition < entries[j].Partition
+	})
+	return entries
 }
 
 // Committed returns the committed offset for (group, topic, partition),

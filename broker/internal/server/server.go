@@ -466,6 +466,10 @@ func (s *Server) dispatch(op proto.OpCode, apiKey string, body []byte, w io.Writ
 		return s.handleListGroups(body, w)
 	case proto.OpDescribeGroup:
 		return s.handleDescribeGroup(body, w)
+	case proto.OpListGroupOffsets:
+		return s.handleListGroupOffsets(body, w)
+	case proto.OpDeleteGroup:
+		return s.handleDeleteGroup(body, w)
 	case proto.OpClusterStatus:
 		return s.handleClusterStatus(body, w)
 	case proto.OpUpdateTopicConfig:
@@ -766,6 +770,59 @@ func (s *Server) handleDescribeGroup(body []byte, w io.Writer) error {
 			Name: details.Name, Generation: details.Generation,
 			Topics: details.Topics, Members: members,
 		}.Encode())
+}
+
+func (s *Server) handleListGroupOffsets(body []byte, w io.Writer) error {
+	req, err := proto.DecodeListGroupOffsetsRequest(body)
+	if err != nil {
+		return proto.WriteErrorResponse(w, proto.OpListGroupOffsets, proto.StatusInvalidRequest, err.Error())
+	}
+	mgr := s.core.Groups()
+	if mgr == nil {
+		return proto.WriteResponse(w, proto.OpListGroupOffsets, proto.StatusOK,
+			proto.ListGroupOffsetsResponse{}.Encode())
+	}
+	committed := mgr.ListOffsets(req.Group)
+	entries := make([]proto.GroupOffsetEntry, 0, len(committed))
+	for _, e := range committed {
+		hw, err := s.core.HighWater(context.Background(), proto.PartitionRef{Topic: e.Topic, Index: e.Partition})
+		if err != nil {
+			// Topic likely deleted out from under the commit record; surface
+			// with HighWater=NoOffset so the operator sees the gap rather
+			// than the call failing.
+			hw = -1
+		}
+		entries = append(entries, proto.GroupOffsetEntry{
+			Topic:     e.Topic,
+			Partition: e.Partition,
+			Committed: e.Offset,
+			HighWater: hw,
+		})
+	}
+	return proto.WriteResponse(w, proto.OpListGroupOffsets, proto.StatusOK,
+		proto.ListGroupOffsetsResponse{Entries: entries}.Encode())
+}
+
+func (s *Server) handleDeleteGroup(body []byte, w io.Writer) error {
+	req, err := proto.DecodeDeleteGroupRequest(body)
+	if err != nil {
+		return proto.WriteErrorResponse(w, proto.OpDeleteGroup, proto.StatusInvalidRequest, err.Error())
+	}
+	mgr := s.core.Groups()
+	if mgr == nil {
+		return proto.WriteErrorResponse(w, proto.OpDeleteGroup, proto.StatusUnknownMember,
+			"server has no group manager")
+	}
+	if err := mgr.Delete(req.Group); err != nil {
+		// ErrUnknownGroup → StatusUnknownMember; anything else →
+		// StatusInternal so the operator distinguishes "name was
+		// wrong" from "broker had a problem".
+		if errors.Is(err, groups.ErrUnknownGroup) {
+			return proto.WriteErrorResponse(w, proto.OpDeleteGroup, proto.StatusUnknownMember, err.Error())
+		}
+		return proto.WriteErrorResponse(w, proto.OpDeleteGroup, proto.StatusInternal, err.Error())
+	}
+	return proto.WriteResponse(w, proto.OpDeleteGroup, proto.StatusOK, nil)
 }
 
 func (s *Server) handleCommit(body []byte, w io.Writer) error {

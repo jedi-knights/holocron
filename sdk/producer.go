@@ -108,11 +108,18 @@ type Producer struct {
 	linger        time.Duration
 	batchSize     int
 	codec         proto.Codec
-	rateLimitTries int           // 0 disables retry; 1+ retries per Send
-	rateLimitWait  time.Duration // base wait between retry attempts
-	idempotent     bool          // producer stamps records for broker dedup
-	producerID     string        // unique to this Producer instance
-	onSent         []SentHook    // fired after each successful Send / SendBatch
+	codecLevel    uint8 // LZ4 level: 0 = fast, 1..9 = HC at that level
+	// inFlight is a semaphore bounding concurrent SendNoWait
+	// publishes when WithMaxInFlight is set. nil means unbounded
+	// (the default).
+	inFlight chan struct{}
+	rateLimitTries int                    // 0 disables retry; 1+ retries per Send
+	rateLimitWait  time.Duration          // base wait between retry attempts
+	retryStatuses  map[proto.Status]bool  // additional statuses that trigger retry
+	idempotent     bool             // producer stamps records for broker dedup
+	producerID     string           // unique to this Producer instance
+	onSent         []SentHook       // fired after each successful Send / SendBatch
+	onAsyncError   []AsyncErrorHook // fired per failed SendNoWait record
 
 	mu     sync.Mutex
 	closed bool
@@ -125,6 +132,10 @@ type Producer struct {
 	// errors that didn't surface to a synchronous caller. Operators
 	// poll AsyncErrors() to detect a misbehaving producer.
 	asyncErrors atomic.Int64
+	// sendCount counts records successfully delivered to the
+	// transport across Send / SendBatch / SendNoWait. Pairs with
+	// AsyncErrors() and PendingCount() for a full health snapshot.
+	sendCount atomic.Int64
 }
 
 // ProducerOption configures a Producer.
@@ -180,6 +191,19 @@ func WithCompression(c Codec) ProducerOption {
 	return func(pr *Producer) { pr.codec = c }
 }
 
+// WithCompressionLevel tunes the LZ4 codec's compression level.
+// 0 (default) picks the fast LZ4 block compressor — same behavior
+// as before. Levels 1..9 switch to LZ4-HC at that level for
+// progressively higher compression ratio at higher CPU cost.
+//
+// Only effective when paired with WithCompression(CodecLZ4); a
+// no-op for other codecs. The wire format is identical regardless
+// of level so consumers (and brokers running an older SDK) decode
+// without change.
+func WithCompressionLevel(level uint8) ProducerOption {
+	return func(pr *Producer) { pr.codecLevel = level }
+}
+
 // WithRateLimitRetry causes Send / SendBatch to retry on a broker
 // StatusRateLimited response, sleeping `wait` between attempts (with
 // exponential backoff capped at 8x). After `tries` attempts the
@@ -189,6 +213,24 @@ func WithRateLimitRetry(tries int, wait time.Duration) ProducerOption {
 	return func(pr *Producer) {
 		pr.rateLimitTries = tries
 		pr.rateLimitWait = wait
+	}
+}
+
+// WithRetryOn extends Send/SendBatch retry behavior to the named
+// broker statuses in addition to the built-in StatusRateLimited.
+// Useful for transient errors like StatusNotLeader during a
+// leadership change — without retrying that status, every Send
+// during the failover window fails. Tries and backoff are
+// controlled by WithRateLimitRetry; WithRetryOn only widens the
+// set of statuses that trigger retry.
+func WithRetryOn(statuses ...proto.Status) ProducerOption {
+	return func(pr *Producer) {
+		if pr.retryStatuses == nil {
+			pr.retryStatuses = make(map[proto.Status]bool, len(statuses))
+		}
+		for _, s := range statuses {
+			pr.retryStatuses[s] = true
+		}
 	}
 }
 
@@ -208,6 +250,48 @@ type SentHook func(p proto.PartitionRef, offset int64)
 func WithOnSent(fn SentHook) ProducerOption {
 	return func(pr *Producer) {
 		pr.onSent = append(pr.onSent, fn)
+	}
+}
+
+// AsyncErrorHook is invoked once per fire-and-forget (SendNoWait)
+// record that fails to reach the broker. Pairs with the
+// AsyncErrors() counter — the counter answers "is anything wrong
+// at all?", the hook answers "which partition, with what error?".
+//
+// The hook fires from the publish goroutine that observed the
+// failure. It must be cheap and non-blocking; long-running work
+// belongs in a downstream queue.
+type AsyncErrorHook func(p proto.PartitionRef, err error)
+
+// WithOnAsyncError registers a callback invoked per failed
+// SendNoWait record. Multiple registrations chain in order. Useful
+// for surfacing fire-and-forget failures to alerting systems
+// without polling AsyncErrors().
+func WithOnAsyncError(fn AsyncErrorHook) ProducerOption {
+	return func(pr *Producer) {
+		pr.onAsyncError = append(pr.onAsyncError, fn)
+	}
+}
+
+// WithMaxInFlight caps the number of concurrent in-flight
+// SendNoWait publishes at n. Once n goroutines are publishing,
+// subsequent SendNoWait calls block until one completes — the
+// caller's send rate is implicitly throttled by the wire.
+//
+// Bounds memory under fire-and-forget bursts where unconstrained
+// SendNoWait would otherwise spawn an unbounded number of
+// goroutines (each holding a record). Synchronous Send is
+// unaffected — its goroutine count is already bounded by the
+// caller's concurrency.
+//
+// n <= 0 means unbounded (the default). Only effective for
+// SendNoWait without WithLinger; the linger path already coalesces
+// records through per-partition batchers.
+func WithMaxInFlight(n int) ProducerOption {
+	return func(pr *Producer) {
+		if n > 0 {
+			pr.inFlight = make(chan struct{}, n)
+		}
 	}
 }
 
@@ -264,6 +348,9 @@ func NewProducer(t Transport, opts ...ProducerOption) (*Producer, error) {
 	if p.codec != CodecNone {
 		if cs, ok := p.transport.(interface{ SetCompression(proto.Codec) }); ok {
 			cs.SetCompression(p.codec)
+		}
+		if cs, ok := p.transport.(interface{ SetCompressionLevel(uint8) }); ok {
+			cs.SetCompressionLevel(p.codecLevel)
 		}
 	}
 	return p, nil
@@ -332,12 +419,19 @@ func (p *Producer) fireOnSent(pref proto.PartitionRef, offset int64) {
 func (p *Producer) publishWithRetry(ctx context.Context, pref proto.PartitionRef, r proto.Record) (int64, error) {
 	tries := p.rateLimitTries
 	if tries < 1 {
-		return p.transport.Publish(ctx, pref, r)
+		offset, err := p.transport.Publish(ctx, pref, r)
+		if err == nil {
+			p.sendCount.Add(1)
+		}
+		return offset, err
 	}
 	wait := p.rateLimitWait
 	for attempt := 0; ; attempt++ {
 		offset, err := p.transport.Publish(ctx, pref, r)
-		if err == nil || !isRateLimited(err) || attempt >= tries {
+		if err == nil || !p.shouldRetry(err) || attempt >= tries {
+			if err == nil {
+				p.sendCount.Add(1)
+			}
 			return offset, err
 		}
 		select {
@@ -348,12 +442,20 @@ func (p *Producer) publishWithRetry(ctx context.Context, pref proto.PartitionRef
 	}
 }
 
-// isRateLimited returns true when err is the broker's StatusRateLimited
-// surface — the SDK's signal to back off.
-func isRateLimited(err error) bool {
+// shouldRetry reports whether err is a retryable broker status —
+// the built-in StatusRateLimited plus any additional statuses
+// configured via WithRetryOn.
+func (p *Producer) shouldRetry(err error) bool {
 	var pe *proto.ProtocolError
-	return errors.As(err, &pe) && pe.Status == proto.StatusRateLimited
+	if !errors.As(err, &pe) {
+		return false
+	}
+	if pe.Status == proto.StatusRateLimited {
+		return true
+	}
+	return p.retryStatuses[pe.Status]
 }
+
 
 // backoff computes the wait duration for attempt n, doubling each time
 // and capping at 8x base.
@@ -387,6 +489,7 @@ func (p *Producer) SendBatch(ctx context.Context, topic string, records []proto.
 	if err != nil {
 		return nil, fmt.Errorf("sdk: SendBatch: %w", err)
 	}
+	p.sendCount.Add(int64(len(records)))
 	offsets := make([]int64, len(records))
 	for i := range records {
 		offsets[i] = baseOffset + int64(i)
@@ -431,13 +534,114 @@ func (p *Producer) SendNoWait(ctx context.Context, topic string, r proto.Record)
 		return p.enqueueNoWait(pref, r)
 	}
 	// No linger — fire a publish goroutine and return. Errors hit
-	// the async-errors counter rather than the caller.
+	// the async-errors counter rather than the caller, and fire
+	// any registered OnAsyncError hooks with (partition, err).
+	//
+	// When WithMaxInFlight bounds outstanding publishes, acquire
+	// a slot here (may block) and release it inside the goroutine
+	// after the publish completes. Acquiring before launching the
+	// goroutine is the throttle: if the cap is reached, the
+	// SendNoWait caller waits until a slot frees.
+	if p.inFlight != nil {
+		select {
+		case p.inFlight <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	go func() {
 		if _, err := p.publishWithRetry(context.Background(), pref, r); err != nil {
-			p.recordAsyncError()
+			p.recordAsyncError(pref, err)
+		}
+		if p.inFlight != nil {
+			<-p.inFlight
 		}
 	}()
 	return nil
+}
+
+// PendingCount returns the total number of records currently
+// sitting in per-partition batchers waiting for the linger window
+// to expire or the next Flush. Useful for backpressure-aware
+// callers and observability — pairs with AsyncErrors() to answer
+// "is the producer healthy?".
+//
+// The count is a snapshot; with concurrent Send calls it changes
+// between the read and the next call.
+func (p *Producer) PendingCount() int {
+	p.mu.Lock()
+	batchers := make([]*batcher, 0, len(p.batchers))
+	for _, b := range p.batchers {
+		batchers = append(batchers, b)
+	}
+	p.mu.Unlock()
+	total := 0
+	for _, b := range batchers {
+		b.mu.Lock()
+		total += len(b.pending)
+		b.mu.Unlock()
+	}
+	return total
+}
+
+// ProducerStats is a one-call observability snapshot — the fields a
+// monitoring caller wants without calling four accessors. Captured
+// atomically per field but the struct itself is not a single
+// consistent moment in time (Pending and BatcherCount walk the
+// batcher map under its own mutex).
+type ProducerStats struct {
+	// SendCount is the cumulative number of records successfully
+	// delivered to the transport across Send/SendBatch/SendNoWait.
+	SendCount int64
+	// AsyncErrors is the cumulative number of SendNoWait flushes
+	// that failed.
+	AsyncErrors int64
+	// Pending is the snapshot count of records currently sitting
+	// in per-partition batchers waiting for the linger window or
+	// next Flush.
+	Pending int
+	// BatcherCount is the number of distinct partitions the
+	// producer has touched (one batcher per partition seen).
+	// Useful for spotting a producer that fans out across more
+	// partitions than expected.
+	BatcherCount int
+}
+
+// Stats returns a one-call observability snapshot covering the
+// individual SendCount/AsyncErrors/PendingCount accessors plus the
+// new BatcherCount. Useful for monitoring loops and metrics
+// emitters that want every field in one go.
+func (p *Producer) Stats() ProducerStats {
+	p.mu.Lock()
+	batchers := make([]*batcher, 0, len(p.batchers))
+	for _, b := range p.batchers {
+		batchers = append(batchers, b)
+	}
+	p.mu.Unlock()
+	pending := 0
+	for _, b := range batchers {
+		b.mu.Lock()
+		pending += len(b.pending)
+		b.mu.Unlock()
+	}
+	return ProducerStats{
+		SendCount:    p.sendCount.Load(),
+		AsyncErrors:  p.asyncErrors.Load(),
+		Pending:      pending,
+		BatcherCount: len(batchers),
+	}
+}
+
+// SendCount returns the cumulative number of records this Producer
+// has successfully delivered to the transport across Send,
+// SendBatch, and SendNoWait. Atomic; safe for concurrent reads.
+//
+// Pairs with AsyncErrors() and PendingCount() for a full producer
+// health snapshot: SendCount answers "how much have we shipped?",
+// AsyncErrors answers "how many fire-and-forget failed?",
+// PendingCount answers "how much is buffered right now?".
+func (p *Producer) SendCount() int64 {
+	return p.sendCount.Load()
 }
 
 // AsyncErrors returns the cumulative count of SendNoWait flushes
@@ -448,11 +652,18 @@ func (p *Producer) AsyncErrors() int64 {
 	return p.asyncErrors.Load()
 }
 
-// recordAsyncError bumps the async-error counter. Called by the
-// batcher when a flush carries records whose callers chose
-// fire-and-forget delivery.
-func (p *Producer) recordAsyncError() {
+// recordAsyncError bumps the async-error counter and fires any
+// registered OnAsyncError hooks. Called by the batcher when a flush
+// carries records whose callers chose fire-and-forget delivery, and
+// by the no-linger SendNoWait goroutine when a single Publish
+// fails. The counter and hooks together let operators monitor
+// async failures both quantitatively (how many?) and qualitatively
+// (which partitions, with what errors?).
+func (p *Producer) recordAsyncError(pref proto.PartitionRef, err error) {
 	p.asyncErrors.Add(1)
+	for _, fn := range p.onAsyncError {
+		fn(pref, err)
+	}
 }
 
 // enqueueNoWait is the SendNoWait equivalent of enqueue: adds the

@@ -97,6 +97,7 @@ func run(args []string) error {
 		{"record", runRecord},
 		{"bench", runBench},
 		{"tail", runTail},
+		{"ping", runPing},
 	}
 	for _, c := range commands {
 		if c.name == args[0] {

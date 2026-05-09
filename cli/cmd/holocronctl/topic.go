@@ -14,17 +14,27 @@ import (
 // runTopic dispatches `topic <subcommand>`.
 func runTopic(args []string) error {
 	if len(args) == 0 {
-		return errors.New("topic: subcommand required (create | delete | describe | list | stats | update)")
+		return errors.New("topic: subcommand required (copy | create | delete | describe | dump | head | last | list | load | stats | update)")
 	}
 	switch args[0] {
+	case "copy":
+		return runTopicCopy(args[1:])
 	case "create":
 		return runTopicCreate(args[1:])
 	case "delete":
 		return runTopicDelete(args[1:])
 	case "describe":
 		return runTopicDescribe(args[1:])
+	case "dump":
+		return runTopicDump(args[1:])
+	case "head":
+		return runTopicHead(args[1:])
+	case "last":
+		return runTopicLast(args[1:])
 	case "list":
 		return runTopicList(args[1:])
+	case "load":
+		return runTopicLoad(args[1:])
 	case "stats":
 		return runTopicStats(args[1:])
 	case "update":
@@ -43,14 +53,15 @@ func runTopicStats(args []string) error {
 	fs := flag.NewFlagSet("topic stats", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:9092", "broker address")
 	apiKey := fs.String("api-key", "", "API key for handshake")
-	name := fs.String("topic", "", "topic name (required)")
+	name := fs.String("topic", "", "topic name (required unless --all-topics)")
+	allTopics := fs.Bool("all-topics", false, "report stats for every topic in the registry")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *name == "" {
-		return errors.New("topic stats: --topic is required")
+	if !*allTopics && *name == "" {
+		return errors.New("topic stats: --topic is required (or pass --all-topics)")
 	}
 
 	tr, err := dial(*addr, *apiKey)
@@ -61,25 +72,40 @@ func runTopicStats(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+
+	if *allTopics {
+		topics, err := tr.ListTopics(ctx)
+		if err != nil {
+			return fmt.Errorf("list topics: %w", err)
+		}
+		out := make([]map[string]any, 0, len(topics))
+		for _, t := range topics {
+			s, total, err := topicStatsFor(ctx, tr, t.Name, t.PartitionCount)
+			if err != nil {
+				return err
+			}
+			out = append(out, map[string]any{
+				"topic":      t.Name,
+				"partitions": s,
+				"total":      total,
+			})
+		}
+		if *jsonOut {
+			return printJSON(out)
+		}
+		for _, entry := range out {
+			fmt.Printf("topic: %s (%d record(s) total)\n", entry["topic"], entry["total"])
+		}
+		return nil
+	}
+
 	parts, err := tr.PartitionsFor(ctx, *name)
 	if err != nil {
 		return fmt.Errorf("partitions for %q: %w", *name, err)
 	}
-
-	type partStat struct {
-		Partition int32 `json:"partition"`
-		HighWater int64 `json:"high_water"`
-		Records   int64 `json:"records"`
-	}
-	stats := make([]partStat, 0, parts)
-	var total int64
-	for i := int32(0); i < parts; i++ {
-		hw, err := tr.HighWater(ctx, proto.PartitionRef{Topic: *name, Index: i})
-		if err != nil {
-			return fmt.Errorf("high-water %s/%d: %w", *name, i, err)
-		}
-		stats = append(stats, partStat{Partition: i, HighWater: hw, Records: hw})
-		total += hw
+	stats, total, err := topicStatsFor(ctx, tr, *name, parts)
+	if err != nil {
+		return err
 	}
 
 	if *jsonOut {
@@ -94,6 +120,30 @@ func runTopicStats(args []string) error {
 		fmt.Printf("  partition %d: %d record(s) (high-water %d)\n", s.Partition, s.Records, s.HighWater)
 	}
 	return nil
+}
+
+// topicPartitionStat is the per-partition row returned by topicStatsFor.
+type topicPartitionStat struct {
+	Partition int32 `json:"partition"`
+	HighWater int64 `json:"high_water"`
+	Records   int64 `json:"records"`
+}
+
+// topicStatsFor walks every partition of a topic and collects
+// per-partition record counts derived from each high-water. Shared
+// by the single-topic and --all-topics paths.
+func topicStatsFor(ctx context.Context, tr *holocronnet.Transport, name string, parts int32) ([]topicPartitionStat, int64, error) {
+	stats := make([]topicPartitionStat, 0, parts)
+	var total int64
+	for i := int32(0); i < parts; i++ {
+		hw, err := tr.HighWater(ctx, proto.PartitionRef{Topic: name, Index: i})
+		if err != nil {
+			return nil, 0, fmt.Errorf("high-water %s/%d: %w", name, i, err)
+		}
+		stats = append(stats, topicPartitionStat{Partition: i, HighWater: hw, Records: hw})
+		total += hw
+	}
+	return stats, total, nil
 }
 
 // runTopicUpdate changes a topic's retention and/or segment-size

@@ -35,6 +35,7 @@ func runRecordFetch(args []string) error {
 	topic := fs.String("topic", "", "topic name (required)")
 	partition := fs.Int("partition", 0, "partition index")
 	offset := fs.Int64("offset", -1, "record offset (>= 0, required)")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON (same shape as topic dump)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -72,6 +73,9 @@ func runRecordFetch(args []string) error {
 			*topic, *partition, *offset)
 	}
 	r := records[0]
+	if *jsonOut {
+		return printJSON(toDumpRecord(r))
+	}
 	fmt.Printf("offset:    %d\n", r.Offset)
 	fmt.Printf("timestamp: %d\n", r.Timestamp)
 	fmt.Printf("key:       %q\n", r.Key)

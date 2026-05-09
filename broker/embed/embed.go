@@ -281,6 +281,49 @@ func (b *Broker) CreateTopic(spec TopicSpec) error {
 // Topics returns a snapshot of registered topics.
 func (b *Broker) Topics() []proto.TopicConfig { return b.registry.List() }
 
+// BrokerStats is a one-call observability snapshot of the broker.
+// Captured by walking the registry once so topic/partition counts
+// are consistent at a single moment. Clustering fields are
+// zero-valued for non-clustered brokers (NodeID=="", IsLeader=true
+// since a single-node broker is its own "leader").
+type BrokerStats struct {
+	// TopicCount is the number of topics currently in the
+	// registry.
+	TopicCount int
+	// PartitionCount is the sum of PartitionCount across every
+	// topic. The total partition slots the broker is serving.
+	PartitionCount int
+	// IsLeader reports whether this broker accepts writes. Always
+	// true for non-clustered brokers; for clustered brokers,
+	// matches the underlying Raft state.
+	IsLeader bool
+	// NodeID is the broker's Raft node ID for clustered brokers,
+	// empty otherwise.
+	NodeID string
+}
+
+// Stats returns a one-call observability snapshot of broker state.
+// Useful for monitoring loops and operator dashboards that want a
+// single broker-health readout without walking the registry and
+// cluster API separately.
+func (b *Broker) Stats() BrokerStats {
+	topics := b.registry.List()
+	parts := 0
+	for _, t := range topics {
+		parts += int(t.PartitionCount)
+	}
+	stats := BrokerStats{
+		TopicCount:     len(topics),
+		PartitionCount: parts,
+		IsLeader:       true, // default for non-clustered brokers
+	}
+	if c := b.core.Cluster(); c != nil {
+		stats.IsLeader = c.IsLeader()
+		stats.NodeID = c.NodeID()
+	}
+	return stats
+}
+
 // ListenMetrics starts an HTTP server on addr serving GET /metrics in
 // Prometheus text format. Returns the bound address. The server runs
 // until the Broker is Closed.
