@@ -89,6 +89,26 @@ introduces scaffolding for a later stage.
 | 6 | Connect-style framework for source/sink connectors. |
 | 7 | Optional schema registry. |
 | 8 | Stream processing library — Kafka Streams analog with stateful ops backed by compacted internal topics. |
+| Sustaining | Polish era. ~96 features across 32 batches: per-partition state, multi-task pipelines, persistent dedup, windowing, joins, full CLI surface, observability, pipeline error handling. See [`sustaining.md`](sustaining.md). |
+
+## Deferred work
+
+The eight stages are complete; the sustaining era is closed. Six items
+remain in the backlog, all large enough to be individual stages of
+their own:
+
+| Area | What's deferred | Why deferred |
+|---|---|---|
+| Streams | Exactly-once across produce + commit-offset | Needs broker-side transactions; substantial new wire ops + recovery story |
+| Schema registry | Avro / Protobuf parsing with type/default/nesting compatibility | Needs a real schema parser; batch 27 ships a structural required-field check that catches the common cases |
+| Broker storage | Linux `sendfile(2)` fast path | Disk and wire formats already align (batch 5); needs a build-tagged splice path with compression-aware fallback |
+| Cluster | Per-partition Raft | Decouples write throughput from a single leader; meaningful refactor of the cluster module |
+| Cluster | Continuous follower replication | Batch 22 ships a one-shot snapshot; long-lived replication needs a streaming follower mode tracking the leader's log |
+| Wire protocol | Multiplexed connections (correlation IDs, ordered demux) | One-RPC-per-connection today; multiplexing reduces connection churn at the cost of demux complexity |
+
+These are documented as known shape, not roadmap commitments. The
+codebase is at a natural pause point and any of them is a multi-week
+project on its own.
 
 ## Coverage of the messaging-middleware taxonomy
 

@@ -2,12 +2,12 @@
 
 A from-scratch, append-only event streaming platform — built to understand how systems like Apache Kafka, AWS SQS/SNS, Google Pub/Sub, and AWS EventBridge work beneath the surface.
 
-![Status](https://img.shields.io/badge/status-pre--alpha-orange)
-![Stage](https://img.shields.io/badge/stage-8%20streams-blue)
+![Status](https://img.shields.io/badge/status-feature--frozen-blue)
+![Stage](https://img.shields.io/badge/stage-8%20%2B%20sustaining-blue)
 ![Go](https://img.shields.io/badge/go-1.23+-00ADD8?logo=go)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Status:** Pre-alpha, learning project. The on-disk format, wire protocol, and public APIs will change without notice until the first tagged release.
+> **Status:** Feature-frozen at end of the sustaining era (batches 21–52). The eight roadmap stages are complete and ~96 polish/ergonomics items have landed across SDK, CLI, streams, and observability surface. The remaining six backlog items are large architectural pieces (exactly-once, per-partition Raft, sendfile, continuous replication, multiplexed connections, richer schema parsing) that are documented in [`docs/sustaining.md#deferred-work`](docs/sustaining.md#deferred-work) but not on a roadmap. The on-disk format, wire protocol, and public APIs will change without notice until the first tagged release.
 
 ## Table of contents
 
@@ -218,7 +218,7 @@ For the durable architectural decisions and module boundaries, see [`docs/archit
 
 ## Project layout
 
-Holocron is a Go workspace stitching eight modules together. Each module has a single, clear responsibility.
+Holocron is a Go workspace stitching eight modules together (`proto`, `sdk`, `broker`, `cli`, `connect`, `registry`, `streams`, `examples`). Each has a single, clear responsibility.
 
 ```
 holocron/
@@ -276,6 +276,7 @@ Each stage produces a working, runnable system. Each lands with a `docs/stage-N.
 - [x] **Stage 6 — Connect-style framework.** Source/sink connector interfaces and a `Worker` runtime in a new `connect/` module. Reference connectors: `file.Source` (tail a file → produce) and `file.Sink` (consume → append to a file). Sink tasks share a consumer group, so partition assignment scales horizontally for free (Stage 4). End-to-end demo and test prove the source → broker → sink path through the SDK.
 - [x] **Stage 7 — Optional schema registry.** Standalone `holocron-registry` daemon backed by a holocron topic (`__holocron_schemas`). Service kernel + Confluent-shaped HTTP API (`/subjects`, `/schemas/ids/{id}`, `/compatibility/...`). State recovers on startup by replaying the topic. Idempotent register, monotonic globally-unique IDs, single-partition-for-total-order, opaque schema text.
 - [x] **Stage 8 — Stream processing library.** Kafka Streams analog in a new `streams/` module. Fluent DSL: `Stream(topic).Filter().Map().GroupByKey().Count(store).To(topic)`. Stateless ops (Filter / Map / FlatMap), stateful ops (Count, Aggregate) with a `StateStore` interface and an in-memory implementation. One goroutine per pipeline. Windowing, joins, and changelog-backed stores deferred to follow-ons (compaction is the dependency).
+- [x] **Sustaining (batches 21–52).** Polish era: per-partition state stores with multi-task parallelism, changelog-backed stores with per-partition isolation, tumbling/hopping/session windows, stream-stream and stream-table joins (inner/left/outer), idempotent producer + persistent broker dedup, server-pushed rebalance via long-poll heartbeat, full operator-CLI surface (`group`, `topic`, `record`, `cluster`, `bench`, `tail`, `consume`, `produce`, `ping`, `offset` with `--json` everywhere), Producer/Consumer observability (`Stats`, `SendCount`, `Position`, `Lag`, `TotalLag`), pipeline-level error handling (`WithErrorHandler`, `WithDLQ`), DLQ + retry + transform connectors, schema-registry config + delete + Confluent-shape compat. See [`docs/sustaining.md`](docs/sustaining.md) for the per-theme breakdown.
 
 ## Non-goals
 

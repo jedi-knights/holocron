@@ -139,23 +139,24 @@ producers and consumers can match the format.
 
 ## Known limitations (intentional)
 
-- **Single-task per pipeline.** No per-partition parallelism. Fine
-  pedagogically; production scale needs partition-aware task
-  assignment via consumer groups (the same machinery Stage 4 already
-  has — wiring it in is a follow-on).
-- **State stores are in-memory only.** No changelog topic, no
-  recovery on restart. The follow-on is straightforward but waits on
-  log compaction.
-- **No windowing.** `Count` and `Aggregate` are over the entire
-  history of a key. Tumbling, hopping, and session windows all
-  require time semantics (event time vs processing time, watermarks)
-  which is a stage of its own.
-- **No joins.** Stream-stream and stream-table joins need windowing
-  and time semantics; both deferred.
-- **Offsets reset on restart.** The runtime subscribes from offset 0;
-  the broker already has consumer groups for resumption (Stage 4),
-  but the streams runtime doesn't yet wire `WithGroup`. One-line fix
-  once the consumer-group / state-store recovery story is unified.
+The list below was the V1 cut. Most items have since been addressed
+during the sustaining era — see [`sustaining.md`](sustaining.md) for
+the per-theme breakdown.
+
+- ~~**Single-task per pipeline.**~~ Resolved in batch 4 sustaining
+  (`WithMaxTasks`) and batch 21 (per-partition state stores). Each
+  partition now gets its own task and per-partition store.
+- ~~**State stores are in-memory only.**~~ Resolved in batch 4
+  (`WithChangelogStores`) + batch 22 (per-partition changelog topics).
+  State recovers on restart by replaying the changelog.
+- ~~**No windowing.**~~ Resolved in batch 4 (tumbling) + batch 7
+  (hopping, session, event-time + watermarks).
+- ~~**No joins.**~~ Resolved in batch 7 (stream-stream join) + batch
+  26 (LeftJoin) + batch 27 (OuterJoin) + KTable + JoinTable.
+- ~~**Offsets reset on restart.**~~ Resolved in batch 2 (streams
+  runtime now uses consumer groups so committed offsets resume across
+  restart).
 - **No exactly-once.** Each record is processed at-least-once.
   Exactly-once would require broker-side transactions across produce
-  + commit-offset boundaries — a meaningful broker addition.
+  + commit-offset boundaries — a meaningful broker addition. Listed in
+  [`architecture.md#deferred-work`](architecture.md#deferred-work).
