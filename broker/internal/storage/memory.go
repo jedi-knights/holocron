@@ -95,6 +95,23 @@ func (s *MemoryStore) Sync(ctx context.Context, _ proto.PartitionRef) error {
 	return ctx.Err()
 }
 
+// DeleteTopic discards every in-memory partition whose topic
+// matches. Subsequent Reads return empty; subsequent Appends to a
+// re-created topic of the same name start at offset 0.
+func (s *MemoryStore) DeleteTopic(ctx context.Context, topic string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for p := range s.partitions {
+		if p.Topic == topic {
+			delete(s.partitions, p)
+		}
+	}
+	return nil
+}
+
 // Close is a no-op for the in-memory store.
 func (s *MemoryStore) Close() error { return nil }
 

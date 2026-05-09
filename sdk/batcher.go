@@ -70,9 +70,41 @@ func (b *batcher) add(ctx context.Context, r proto.Record) (int64, error) {
 	}
 }
 
+// addNoWait enqueues r without registering a result channel. The
+// caller doesn't block for the flush; flush errors increment the
+// Producer's async-error counter rather than returning to the
+// caller. Pairs with Producer.SendNoWait.
+func (b *batcher) addNoWait(r proto.Record) error {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return errors.New("sdk: batcher closed")
+	}
+	b.pending = append(b.pending, r)
+	b.results = append(b.results, nil) // nil result ⇒ no waiter
+	shouldFlush := len(b.pending) >= b.producer.batchSize
+	if !shouldFlush && b.timer == nil {
+		b.timer = time.AfterFunc(b.producer.linger, func() {
+			_ = b.flushNow(context.Background())
+		})
+	}
+	b.mu.Unlock()
+
+	if shouldFlush {
+		go func() {
+			_ = b.flushNow(context.Background())
+		}()
+	}
+	return nil
+}
+
 // flushNow sends every pending record as one ProduceBatch RPC and
 // resolves each result channel with the offset the broker assigned.
 // Safe to call concurrently — at most one flush is in flight at a time.
+//
+// Result channels may be nil for records added via addNoWait: those
+// records' flush failures bump the Producer's async-error counter
+// rather than reporting to a synchronous caller.
 func (b *batcher) flushNow(ctx context.Context) error {
 	b.mu.Lock()
 	if len(b.pending) == 0 {
@@ -92,6 +124,10 @@ func (b *batcher) flushNow(ctx context.Context) error {
 	baseOffset, err := b.producer.transport.PublishBatch(ctx, b.pref, pending)
 	if err != nil {
 		for _, ch := range results {
+			if ch == nil {
+				b.producer.recordAsyncError()
+				continue
+			}
 			ch <- batchResult{err: err}
 		}
 		return err
@@ -99,12 +135,19 @@ func (b *batcher) flushNow(ctx context.Context) error {
 	if b.producer.acks == AcksDurable {
 		if syncErr := b.producer.transport.Sync(ctx, b.pref); syncErr != nil {
 			for _, ch := range results {
+				if ch == nil {
+					b.producer.recordAsyncError()
+					continue
+				}
 				ch <- batchResult{err: syncErr}
 			}
 			return syncErr
 		}
 	}
 	for i, ch := range results {
+		if ch == nil {
+			continue // no-wait record; nothing to signal
+		}
 		ch <- batchResult{offset: baseOffset + int64(i)}
 	}
 	return nil
@@ -125,6 +168,10 @@ func (b *batcher) shutdown() {
 		b.timer = nil
 	}
 	for _, ch := range b.results {
+		if ch == nil {
+			b.producer.recordAsyncError()
+			continue
+		}
 		ch <- batchResult{err: errors.New("sdk: producer closed")}
 	}
 	b.pending = nil

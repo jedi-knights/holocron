@@ -19,14 +19,15 @@ import (
 // space, and a record with no key has nowhere to live.
 //
 // A KTable runs one consumer goroutine per source partition (driven by
-// the topology's maxTasks); the store is shared across them. As of
-// V1, the same Get/Put atomicity caveat as Count applies under
-// maxTasks > 1, mitigated by the streamsHeartbeatInterval tightening
-// from batch 9.
+// the topology's maxTasks). State is partition-scoped: each partition's
+// records flow into that partition's substore. Lookups via Get
+// aggregate across substores, which is correct for the table's
+// last-value-wins-per-key contract since a key is stable to one
+// partition under the sticky partitioner.
 type KTable struct {
 	topology *Topology
 	source   string
-	store    StateStore
+	store    *PartitionedStore
 	group    string
 }
 
@@ -58,8 +59,10 @@ func (t *Topology) Table(source, storeName string) *KTable {
 }
 
 // Get returns the latest value for key, or (nil, false) if the key
-// has never been seen or its tombstone has fired. Safe for concurrent
-// use by other pipeline operators.
+// has never been seen or its tombstone has fired. The aggregated read
+// across all partition substores is safe because a key is stable to
+// one partition under the sticky partitioner, so at most one substore
+// holds an entry for a given key.
 func (k *KTable) Get(key []byte) ([]byte, bool) {
 	return k.store.Get(key)
 }
@@ -88,7 +91,7 @@ func (t *Topology) runTable(ctx context.Context, kt *KTable) {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		records, err := consumer.Poll(ctx, 256)
+		records, err := consumer.PollMeta(ctx, 256)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
@@ -96,15 +99,17 @@ func (t *Topology) runTable(ctx context.Context, kt *KTable) {
 			t.recordErr(fmt.Errorf("streams: ktable %q poll: %w", kt.source, err))
 			return
 		}
-		for _, r := range records {
+		for _, pr := range records {
+			r := pr.Record
 			if len(r.Key) == 0 {
 				continue
 			}
+			sub := kt.store.For(int(pr.Partition.Index))
 			if r.Value == nil {
-				kt.store.Delete(r.Key)
+				sub.Delete(r.Key)
 				continue
 			}
-			kt.store.Put(r.Key, r.Value)
+			sub.Put(r.Key, r.Value)
 		}
 		if len(records) > 0 {
 			for part, off := range consumer.LatestOffsets() {
@@ -132,7 +137,7 @@ type TableJoinFunc func(streamRec proto.Record, tableValue []byte, tableHit bool
 // has no time component: the table's current value at the moment the
 // stream record is processed is what joinFn sees.
 func (s *Stream) JoinTable(table *KTable, joinFn TableJoinFunc) *Stream {
-	return s.appendOp(func(r proto.Record, _ *Topology) []proto.Record {
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
 		val, ok := table.Get(r.Key)
 		return joinFn(r, val, ok)
 	})

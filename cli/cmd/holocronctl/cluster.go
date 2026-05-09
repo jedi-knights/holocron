@@ -11,17 +11,64 @@ import (
 // runCluster dispatches `cluster <subcommand>`.
 func runCluster(args []string) error {
 	if len(args) == 0 {
-		return errors.New("cluster: subcommand required (members | join | leave)")
+		return errors.New("cluster: subcommand required (members | status | join | leave)")
 	}
 	switch args[0] {
 	case "members":
 		return runClusterMembers(args[1:])
+	case "status":
+		return runClusterStatus(args[1:])
 	case "join":
 		return runClusterJoin(args[1:])
 	case "leave":
 		return runClusterLeave(args[1:])
 	}
 	return fmt.Errorf("cluster: unknown subcommand %q", args[0])
+}
+
+// runClusterStatus reports the responding broker's Raft leader
+// view — this node's ID, whether it holds leadership, and the
+// leader it last observed. Pairs with `cluster members` (which
+// lists membership) so an operator can answer "where's the
+// leader?" in one call.
+func runClusterStatus(args []string) error {
+	fs := flag.NewFlagSet("cluster status", flag.ContinueOnError)
+	addr := fs.String("addr", "127.0.0.1:9092", "broker address")
+	apiKey := fs.String("api-key", "", "API key for handshake")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	tr, err := dial(*addr, *apiKey)
+	if err != nil {
+		return err
+	}
+	defer tr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	st, err := tr.ClusterStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("cluster status: %w", err)
+	}
+	if *jsonOut {
+		return printJSON(st)
+	}
+	if st.NodeID == "" {
+		fmt.Println("(broker is not part of a cluster)")
+		return nil
+	}
+	fmt.Printf("node_id:     %s\n", st.NodeID)
+	fmt.Printf("is_leader:   %t\n", st.IsLeader)
+	if st.LeaderID != "" {
+		fmt.Printf("leader_id:   %s\n", st.LeaderID)
+		fmt.Printf("leader_addr: %s\n", st.LeaderAddr)
+	} else {
+		fmt.Println("leader:      (election in progress)")
+	}
+	return nil
 }
 
 func runClusterMembers(args []string) error {

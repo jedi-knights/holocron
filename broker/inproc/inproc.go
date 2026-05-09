@@ -7,6 +7,7 @@ package inproc
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jedi-knights/holocron/broker/internal/broker"
 	"github.com/jedi-knights/holocron/broker/internal/topic"
@@ -104,18 +105,21 @@ func (t *Transport) JoinGroup(ctx context.Context, group, memberID string, topic
 	return out, nil
 }
 
-// Heartbeat reports liveness via the broker's group manager.
-func (t *Transport) Heartbeat(ctx context.Context, group, memberID string, generation int32) (sdk.HeartbeatResult, error) {
-	_ = ctx
+// Heartbeat reports liveness via the broker's group manager. When
+// maxWait > 0 the call delegates to HeartbeatWait, which holds the
+// reply until the group rebalances or the deadline elapses — the
+// in-process equivalent of the network long-poll.
+func (t *Transport) Heartbeat(ctx context.Context, group, memberID string, generation int32, maxWait time.Duration) (sdk.HeartbeatResult, error) {
 	mgr := t.b.Groups()
 	if mgr == nil {
 		return sdk.HeartbeatResult{}, errors.New("inproc: broker has no group manager")
 	}
-	res, err := mgr.Heartbeat(group, memberID, generation)
-	if err != nil {
+	if maxWait > 0 {
+		res, err := mgr.HeartbeatWait(ctx, group, memberID, generation, maxWait)
 		return sdk.HeartbeatResult{RebalanceNeeded: res.RebalanceNeeded}, err
 	}
-	return sdk.HeartbeatResult{RebalanceNeeded: res.RebalanceNeeded}, nil
+	res, err := mgr.Heartbeat(group, memberID, generation)
+	return sdk.HeartbeatResult{RebalanceNeeded: res.RebalanceNeeded}, err
 }
 
 // LeaveGroup deregisters a member from a group.
@@ -171,6 +175,14 @@ func (t *Transport) EnsureTopic(ctx context.Context, name string, partitions int
 		return nil
 	}
 	return err
+}
+
+// DeleteTopic removes the named topic and every record on it from
+// the embedded broker. Mirrors the network transport's DeleteTopic
+// so in-process and over-the-wire callers see identical semantics.
+func (t *Transport) DeleteTopic(ctx context.Context, name string) error {
+	_ = ctx
+	return t.b.DeleteTopic(name)
 }
 
 // Close releases transport resources. The broker itself is not owned by

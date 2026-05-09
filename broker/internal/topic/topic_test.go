@@ -70,3 +70,84 @@ func TestRegistry_PartitionsForReturnsCount(t *testing.T) {
 		t.Fatalf("got %d, want 8", n)
 	}
 }
+
+// TestRegistry_UpdateConfigChangesRetentionAndSegment proves
+// UpdateConfig modifies the soft knobs (retention, segment size)
+// of an existing topic without affecting the partition count
+// (which would break ordering invariants if changed).
+func TestRegistry_UpdateConfigChangesRetentionAndSegment(t *testing.T) {
+	// Arrange
+	r := NewRegistry()
+	if err := r.Create(Spec{
+		Name:           "mut",
+		PartitionCount: 4,
+		RetentionMs:    1000,
+		SegmentBytes:   512,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act — bump retention; leave segment alone via 0 sentinel.
+	if err := r.UpdateConfig("mut", 5000, 0); err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+
+	// Assert
+	cfg, err := r.Get("mut")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RetentionMs != 5000 {
+		t.Errorf("retention: got %d, want 5000", cfg.RetentionMs)
+	}
+	if cfg.SegmentBytes != 512 {
+		t.Errorf("segment: got %d, want 512 (unchanged)", cfg.SegmentBytes)
+	}
+	if cfg.PartitionCount != 4 {
+		t.Errorf("partitions: got %d, want 4 (immutable)", cfg.PartitionCount)
+	}
+}
+
+// TestRegistry_UpdateConfigMissingReturnsSentinel proves the
+// update path mirrors Get's not-found contract.
+func TestRegistry_UpdateConfigMissingReturnsSentinel(t *testing.T) {
+	r := NewRegistry()
+	err := r.UpdateConfig("never-existed", 1000, 0)
+	if !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("got %v, want ErrTopicNotFound", err)
+	}
+}
+
+// TestRegistry_DeleteRemovesTopic proves Delete makes a previously
+// created topic invisible to subsequent Get / PartitionsFor calls.
+func TestRegistry_DeleteRemovesTopic(t *testing.T) {
+	// Arrange
+	r := NewRegistry()
+	if err := r.Create(Spec{Name: "ephemeral", PartitionCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act
+	if err := r.Delete("ephemeral"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	// Assert
+	if _, err := r.Get("ephemeral"); !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("after Delete, Get returned %v, want ErrTopicNotFound", err)
+	}
+	if err := r.Create(Spec{Name: "ephemeral", PartitionCount: 1}); err != nil {
+		t.Errorf("recreate after Delete failed: %v", err)
+	}
+}
+
+// TestRegistry_DeleteMissingReturnsSentinel proves deleting an
+// unknown topic returns ErrTopicNotFound rather than silently
+// succeeding — mirrors the Get/PartitionsFor convention.
+func TestRegistry_DeleteMissingReturnsSentinel(t *testing.T) {
+	r := NewRegistry()
+	err := r.Delete("never-existed")
+	if !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("got %v, want ErrTopicNotFound", err)
+	}
+}

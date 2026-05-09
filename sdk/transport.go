@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"time"
 
 	"github.com/jedi-knights/holocron/proto"
 )
@@ -46,7 +47,14 @@ type Transport interface {
 
 	// Heartbeat reports liveness for memberID. RebalanceNeeded=true means
 	// the caller should JoinGroup again.
-	Heartbeat(ctx context.Context, group, memberID string, generation int32) (HeartbeatResult, error)
+	//
+	// maxWait > 0 turns the call into a long-poll: the broker holds the
+	// response open for up to maxWait, returning immediately when the
+	// group rebalances. maxWait == 0 is the historical fire-and-forget
+	// path. SDK consumers in group mode default to a sub-second
+	// long-poll so the rebalance signal is delivered close to
+	// instantly rather than being delayed by the heartbeat tick.
+	Heartbeat(ctx context.Context, group, memberID string, generation int32, maxWait time.Duration) (HeartbeatResult, error)
 
 	// LeaveGroup deregisters memberID. Brokers tolerate Leave for unknown
 	// members so close paths can call it unconditionally.

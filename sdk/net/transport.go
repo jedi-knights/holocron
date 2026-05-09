@@ -41,6 +41,7 @@ type Transport struct {
 
 	mu     sync.Mutex
 	rpc    *connection // shared connection for unary RPCs (produce, metadata, commit, create)
+	hb     *connection // dedicated connection for long-poll Heartbeat calls
 	codec  proto.Codec
 	closed bool
 
@@ -315,6 +316,127 @@ func (t *Transport) HighWater(ctx context.Context, p proto.PartitionRef) (int64,
 	return resp.HighWater, nil
 }
 
+// ListSegments returns the partition's segment manifest at snapshot
+// time — base offsets and current (.log, .idx) sizes captured under
+// the donor's mutex. Pairs with FetchSegmentChunk to ship a
+// brand-new follower the donor's full state in bounded chunks.
+func (t *Transport) ListSegments(ctx context.Context, p proto.PartitionRef) ([]proto.SegmentInfo, error) {
+	body, err := t.do(ctx, proto.OpListSegments, proto.ListSegmentsRequest{
+		Topic:     p.Topic,
+		Partition: p.Index,
+	}.Encode())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := proto.DecodeListSegmentsResponse(body)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Segments, nil
+}
+
+// FetchSegmentChunk returns a byte range from one segment file.
+// Returns an empty slice when offset is at or past the file's
+// listed size — the chunked-read loop's terminator.
+func (t *Transport) FetchSegmentChunk(ctx context.Context, p proto.PartitionRef, base int64, kind proto.SegmentKind, offset int64, maxBytes int32) ([]byte, error) {
+	body, err := t.do(ctx, proto.OpFetchSegmentChunk, proto.FetchSegmentChunkRequest{
+		Topic:     p.Topic,
+		Partition: p.Index,
+		Base:      base,
+		Kind:      kind,
+		Offset:    offset,
+		MaxBytes:  maxBytes,
+	}.Encode())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := proto.DecodeFetchSegmentChunkResponse(body)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Bytes, nil
+}
+
+// UpdateTopicConfig changes the named topic's retention and
+// segment-size settings. retentionMs and segmentBytes <= 0 mean
+// "no change" so callers can adjust one knob at a time.
+// Partition count is immutable.
+func (t *Transport) UpdateTopicConfig(ctx context.Context, name string, retentionMs, segmentBytes int64) error {
+	_, err := t.do(ctx, proto.OpUpdateTopicConfig, proto.UpdateTopicConfigRequest{
+		Name:         name,
+		RetentionMs:  retentionMs,
+		SegmentBytes: segmentBytes,
+	}.Encode())
+	return err
+}
+
+// DeleteTopic removes the named topic and every record on it.
+// Returns ErrTopicNotFound when the topic doesn't exist.
+//
+// Drop is destructive — all records and on-disk segment files are
+// gone after the call returns. The inproc and net Transports both
+// implement this so an embedded broker, in-process tests, and a
+// remote broker behave identically.
+func (t *Transport) DeleteTopic(ctx context.Context, name string) error {
+	_, err := t.do(ctx, proto.OpDeleteTopic, proto.DeleteTopicRequest{Name: name}.Encode())
+	return err
+}
+
+// ListTopics returns every topic the broker knows about. Order
+// is unspecified. Replaces the probe-by-name workaround for
+// `holocronctl topic list` since the broker now enumerates its
+// registry directly.
+func (t *Transport) ListTopics(ctx context.Context) ([]proto.TopicConfig, error) {
+	body, err := t.do(ctx, proto.OpListTopics, proto.ListTopicsRequest{}.Encode())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := proto.DecodeListTopicsResponse(body)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Topics, nil
+}
+
+// ClusterStatus reports the responding broker's Raft leader view:
+// its own node ID, whether it currently holds leadership, and the
+// leader it last observed. An empty NodeID signals the broker
+// isn't part of a cluster.
+func (t *Transport) ClusterStatus(ctx context.Context) (proto.ClusterStatusResponse, error) {
+	body, err := t.do(ctx, proto.OpClusterStatus, proto.ClusterStatusRequest{}.Encode())
+	if err != nil {
+		return proto.ClusterStatusResponse{}, err
+	}
+	return proto.DecodeClusterStatusResponse(body)
+}
+
+// ListGroups returns a summary of every consumer group registered
+// with the broker's group manager. Returns an empty slice on a
+// broker that has no group manager (e.g., a non-clustered Stage 1
+// broker).
+func (t *Transport) ListGroups(ctx context.Context) ([]proto.GroupSummary, error) {
+	body, err := t.do(ctx, proto.OpListGroups, proto.ListGroupsRequest{}.Encode())
+	if err != nil {
+		return nil, err
+	}
+	resp, err := proto.DecodeListGroupsResponse(body)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Groups, nil
+}
+
+// DescribeGroup returns per-member partition assignments for the
+// named consumer group. Returns an error wrapping
+// proto.StatusUnknownMember when the group doesn't exist.
+func (t *Transport) DescribeGroup(ctx context.Context, group string) (proto.DescribeGroupResponse, error) {
+	body, err := t.do(ctx, proto.OpDescribeGroup, proto.DescribeGroupRequest{Group: group}.Encode())
+	if err != nil {
+		return proto.DescribeGroupResponse{}, err
+	}
+	return proto.DecodeDescribeGroupResponse(body)
+}
+
 // EnsureTopic creates the topic if it doesn't exist, returning nil if a
 // topic by that name already exists. Matches the inproc.Transport
 // semantic so connect can auto-create coordination topics regardless of
@@ -369,14 +491,39 @@ func (t *Transport) JoinGroup(ctx context.Context, group, memberID string, topic
 	return out, nil
 }
 
-// Heartbeat reports liveness over the wire. RebalanceNeeded is also
-// returned when the broker responds with StatusRebalanceNeeded.
-func (t *Transport) Heartbeat(ctx context.Context, group, memberID string, generation int32) (sdk.HeartbeatResult, error) {
-	body, err := t.do(ctx, proto.OpHeartbeat, proto.HeartbeatRequest{
+// Heartbeat reports liveness over the wire. When maxWait > 0 the
+// request carries a non-zero MaxWaitMs, signalling the broker to
+// hold the response open for up to that duration and return
+// immediately on rebalance — the network long-poll path. The SDK's
+// per-call deadline is extended to maxWait + a small slack so the
+// transport doesn't fire its own timeout before the server answers.
+// RebalanceNeeded is also returned when the broker responds with
+// StatusRebalanceNeeded.
+//
+// Long-poll heartbeats route through a dedicated heartbeat
+// connection rather than the shared RPC connection. Holding the
+// shared connection's send/receive mutex for the duration of the
+// long-poll would serialize every other RPC behind it; a separate
+// conn lets producers and other consumers proceed concurrently.
+func (t *Transport) Heartbeat(ctx context.Context, group, memberID string, generation int32, maxWait time.Duration) (sdk.HeartbeatResult, error) {
+	encoded := proto.HeartbeatRequest{
 		Group:      group,
 		MemberID:   memberID,
 		Generation: generation,
-	}.Encode())
+		MaxWaitMs:  int32(maxWait / time.Millisecond),
+	}.Encode()
+
+	var (
+		body []byte
+		err  error
+	)
+	if maxWait > 0 {
+		callCtx, cancel := context.WithTimeout(ctx, maxWait+heartbeatLongPollSlack)
+		body, err = t.heartbeatCall(callCtx, proto.OpHeartbeat, encoded)
+		cancel()
+	} else {
+		body, err = t.do(ctx, proto.OpHeartbeat, encoded)
+	}
 	if err != nil {
 		if proto.IsStatus(err, proto.StatusRebalanceNeeded) {
 			return sdk.HeartbeatResult{RebalanceNeeded: true}, nil
@@ -389,6 +536,88 @@ func (t *Transport) Heartbeat(ctx context.Context, group, memberID string, gener
 	}
 	return sdk.HeartbeatResult{RebalanceNeeded: resp.RebalanceNeeded}, nil
 }
+
+// heartbeatCall sends payload on the dedicated heartbeat connection,
+// dialing it lazily on first use. On a transport-level failure the
+// conn is dropped so the next call dials fresh.
+//
+// If ctx is cancelled mid-call (e.g. consumer Close cancels the
+// heartbeat goroutine), the connection is closed so the in-flight
+// blocking read aborts immediately rather than running out the
+// long-poll deadline.
+func (t *Transport) heartbeatCall(ctx context.Context, op proto.OpCode, payload []byte) ([]byte, error) {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil, errors.New("net: transport is closed")
+	}
+	conn := t.hb
+	t.mu.Unlock()
+
+	if conn == nil {
+		fresh, err := t.dialAndHandshake(ctx)
+		if err != nil {
+			return nil, err
+		}
+		t.mu.Lock()
+		if t.closed {
+			t.mu.Unlock()
+			_ = fresh.close()
+			return nil, errors.New("net: transport is closed")
+		}
+		if t.hb == nil {
+			t.hb = fresh
+			conn = fresh
+		} else {
+			// A concurrent Heartbeat already won the dial race.
+			conn = t.hb
+			_ = fresh.close()
+		}
+		t.mu.Unlock()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			t.mu.Lock()
+			if t.hb == conn {
+				t.hb = nil
+			}
+			t.mu.Unlock()
+			_ = conn.close()
+		case <-done:
+		}
+	}()
+
+	body, err := conn.call(op, payload)
+	close(done)
+	if err == nil {
+		return body, nil
+	}
+	var pe *proto.ProtocolError
+	if errors.As(err, &pe) {
+		return nil, err
+	}
+	// Transport-level failure — drop the heartbeat conn so the next
+	// call redials. (The watcher goroutine may have already done so
+	// if ctx was cancelled; the second drop is a no-op.)
+	t.mu.Lock()
+	if t.hb == conn {
+		t.hb = nil
+	}
+	t.mu.Unlock()
+	_ = conn.close()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, err
+}
+
+// heartbeatLongPollSlack pads the transport-side deadline beyond the
+// server-side max-wait so a heartbeat that completes near its
+// deadline isn't aborted by the SDK before the response can land.
+const heartbeatLongPollSlack = 500 * time.Millisecond
 
 // LeaveGroup deregisters memberID over the wire.
 func (t *Transport) LeaveGroup(ctx context.Context, group, memberID string) error {
@@ -418,8 +647,10 @@ func (t *Transport) Close() error {
 	}
 	t.closed = true
 	rpc := t.rpc
+	hb := t.hb
 	cancels := t.subCancel
 	t.rpc = nil
+	t.hb = nil
 	t.subCancel = nil
 	t.mu.Unlock()
 
@@ -428,6 +659,9 @@ func (t *Transport) Close() error {
 	}
 	if rpc != nil {
 		_ = rpc.close()
+	}
+	if hb != nil {
+		_ = hb.close()
 	}
 	t.subWG.Wait()
 	return nil

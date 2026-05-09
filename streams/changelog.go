@@ -17,51 +17,59 @@ import (
 // record, so a short deadline is the floor on startup latency.
 const changelogReplayDeadline = 200 * time.Millisecond
 
-// ChangelogStore is a StateStore backed by a holocron topic. Every Put
-// or Delete is written to <name>-changelog as a record (Put = key+value,
-// Delete = key+nil-value tombstone). On Open, the store replays the
-// topic from offset 0 to rebuild in-memory state.
+// ChangelogStore is a StateStore backed by a holocron topic. Every
+// Put or Delete is written to a single partition of
+// <name>-changelog as a record (Put = key+value, Delete = key+nil
+// tombstone). On Open, the store replays just its own partition
+// from offset 0 to rebuild in-memory state.
 //
-// Combined with broker-side log compaction (which keeps only the latest
-// record per key), the changelog topic stays bounded — same trick used
-// for consumer-group offsets and the schema registry. State persists
-// across topology restarts.
+// Each ChangelogStore is scoped to one partition. Multi-partition
+// topologies open one store per assigned partition so each
+// partition's state survives restart on the same partition of the
+// changelog topic, with no cross-partition leakage.
+//
+// Combined with broker-side log compaction (which keeps only the
+// latest record per key), the changelog topic stays bounded — same
+// trick used for consumer-group offsets and the schema registry.
 //
 // Topic creation is the caller's responsibility; the changelog topic
-// must exist before OpenChangelogStore is called. For best results,
-// create it with a single partition (so total ordering is preserved
-// across keys) and broker-side compaction enabled.
+// must exist with at least (partition + 1) partitions before
+// OpenChangelogStorePartition is called. Compaction is recommended
+// to prevent unbounded growth.
 type ChangelogStore struct {
 	transport sdk.Transport
 	topic     string
-	producer  *sdk.Producer
+	partition int32
 
 	mu      sync.RWMutex
 	entries map[string][]byte
 }
 
-// OpenChangelogStore replays <name>-changelog into an in-memory map and
-// returns a ready-to-use store.
-func OpenChangelogStore(ctx context.Context, transport sdk.Transport, name string) (*ChangelogStore, error) {
+// OpenChangelogStorePartition replays the addressed partition of
+// <name>-changelog into an in-memory map and returns a ready-to-use
+// store. Records on other partitions of the changelog topic do not
+// leak into this store's state — a topology with N source
+// partitions opens N stores so each partition's state lives in its
+// own topic partition.
+func OpenChangelogStorePartition(ctx context.Context, transport sdk.Transport, name string, partition int) (*ChangelogStore, error) {
 	if transport == nil {
 		return nil, errors.New("streams: ChangelogStore requires a Transport")
 	}
 	if name == "" {
 		return nil, errors.New("streams: ChangelogStore requires a name")
 	}
+	if partition < 0 {
+		return nil, errors.New("streams: ChangelogStore requires partition >= 0")
+	}
 	s := &ChangelogStore{
 		transport: transport,
 		topic:     name + "-changelog",
+		partition: int32(partition),
 		entries:   make(map[string][]byte),
 	}
 	if err := s.replay(ctx); err != nil {
-		return nil, fmt.Errorf("streams: replay changelog %q: %w", s.topic, err)
+		return nil, fmt.Errorf("streams: replay changelog %q partition %d: %w", s.topic, partition, err)
 	}
-	p, err := sdk.NewProducer(transport)
-	if err != nil {
-		return nil, fmt.Errorf("streams: changelog producer: %w", err)
-	}
-	s.producer = p
 	return s, nil
 }
 
@@ -71,7 +79,10 @@ func (s *ChangelogStore) replay(ctx context.Context) error {
 		return err
 	}
 	defer consumer.Close()
-	if err := consumer.Subscribe(ctx, s.topic, 0); err != nil {
+	// Self-managed assignment so we read only our own partition,
+	// not every partition the (default) Subscribe path would attach
+	// to. Cross-partition records must not leak into this store.
+	if err := consumer.Assign(ctx, proto.PartitionRef{Topic: s.topic, Index: s.partition}, 0); err != nil {
 		return err
 	}
 
@@ -114,11 +125,11 @@ func (s *ChangelogStore) Get(key []byte) ([]byte, bool) {
 	return out, true
 }
 
-// Put writes a changelog record AND updates the in-memory map. Producer
-// errors are silently swallowed (state diverges from broker). Failures
-// here are unlikely in a healthy system but represent an at-least-once
-// gap if they happen — same trade-off as the in-memory store relative
-// to crashes.
+// Put writes a changelog record to this store's specific partition
+// of the changelog topic AND updates the in-memory map. Transport
+// errors are silently swallowed (state diverges from broker)
+// — same at-least-once trade-off the in-memory store has against
+// crashes.
 func (s *ChangelogStore) Put(key, value []byte) {
 	stored := make([]byte, len(value))
 	copy(stored, value)
@@ -131,14 +142,16 @@ func (s *ChangelogStore) Put(key, value []byte) {
 	copy(keyCopy, key)
 	valCopy := make([]byte, len(value))
 	copy(valCopy, value)
-	_, _ = s.producer.Send(context.Background(), s.topic, proto.Record{
-		Key:   keyCopy,
-		Value: valCopy,
-	})
+	// Publish directly to the assigned partition so the record can't
+	// land on a different partition's changelog and leak across
+	// partitions on replay.
+	_, _ = s.transport.Publish(context.Background(),
+		proto.PartitionRef{Topic: s.topic, Index: s.partition},
+		proto.Record{Key: keyCopy, Value: valCopy})
 }
 
-// Delete writes a tombstone (nil value) and removes the key from the
-// in-memory map.
+// Delete writes a tombstone (nil value) to this store's partition
+// and removes the key from the in-memory map.
 func (s *ChangelogStore) Delete(key []byte) {
 	s.mu.Lock()
 	delete(s.entries, string(key))
@@ -146,10 +159,9 @@ func (s *ChangelogStore) Delete(key []byte) {
 
 	keyCopy := make([]byte, len(key))
 	copy(keyCopy, key)
-	_, _ = s.producer.Send(context.Background(), s.topic, proto.Record{
-		Key:   keyCopy,
-		Value: nil,
-	})
+	_, _ = s.transport.Publish(context.Background(),
+		proto.PartitionRef{Topic: s.topic, Index: s.partition},
+		proto.Record{Key: keyCopy, Value: nil})
 }
 
 // Range iterates a snapshot of (key, value) pairs.
@@ -167,10 +179,6 @@ func (s *ChangelogStore) Range(fn func(key, value []byte) bool) {
 	}
 }
 
-// Close releases the embedded Producer.
-func (s *ChangelogStore) Close() error {
-	if s.producer != nil {
-		return s.producer.Close()
-	}
-	return nil
-}
+// Close is a no-op — the store doesn't own the Transport. Returns
+// nil so callers can defer it uniformly.
+func (s *ChangelogStore) Close() error { return nil }

@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jedi-knights/holocron/proto"
@@ -111,6 +114,81 @@ type Worker struct {
 	wg             sync.WaitGroup
 	errs           []error
 	errsMu         sync.Mutex
+
+	statsMu sync.Mutex
+	stats   map[string]*taskStatCounters // key = connector|index
+}
+
+// TaskStats is a cumulative snapshot of one task's throughput.
+// Records counts records successfully produced (for source tasks)
+// or consumed (for sink tasks); Bytes sums the record values.
+// Snapshots are point-in-time and may differ from the live state
+// by the time the caller reads them.
+type TaskStats struct {
+	Connector string
+	TaskIndex int
+	Records   int64
+	Bytes     int64
+}
+
+// taskStatCounters is the live counter store. Atomic so the
+// per-task hot paths can update without coordinating through the
+// Worker mutex.
+type taskStatCounters struct {
+	records atomic.Int64
+	bytes   atomic.Int64
+}
+
+// taskStatsKey encodes a (connector, taskIndex) pair as a stable
+// map key.
+func taskStatsKey(connector string, index int) string {
+	return fmt.Sprintf("%s|%d", connector, index)
+}
+
+// counters returns the existing counters for the (connector,
+// taskIndex) pair or creates them on first access.
+func (w *Worker) counters(connector string, index int) *taskStatCounters {
+	key := taskStatsKey(connector, index)
+	w.statsMu.Lock()
+	defer w.statsMu.Unlock()
+	if w.stats == nil {
+		w.stats = make(map[string]*taskStatCounters)
+	}
+	c, ok := w.stats[key]
+	if !ok {
+		c = &taskStatCounters{}
+		w.stats[key] = c
+	}
+	return c
+}
+
+// Stats returns a snapshot of every task's cumulative counters.
+// Order is unspecified. Operators poll this for dashboards or
+// liveness checks.
+func (w *Worker) Stats() []TaskStats {
+	w.statsMu.Lock()
+	defer w.statsMu.Unlock()
+	out := make([]TaskStats, 0, len(w.stats))
+	for key, c := range w.stats {
+		// Decode "connector|index" — index is the last |-separated
+		// segment so connector names can contain | safely.
+		idx := strings.LastIndex(key, "|")
+		if idx < 0 {
+			continue
+		}
+		conn := key[:idx]
+		taskIdx, err := strconv.Atoi(key[idx+1:])
+		if err != nil {
+			continue
+		}
+		out = append(out, TaskStats{
+			Connector: conn,
+			TaskIndex: taskIdx,
+			Records:   c.records.Load(),
+			Bytes:     c.bytes.Load(),
+		})
+	}
+	return out
 }
 
 // WorkerOption configures a Worker.
@@ -475,7 +553,7 @@ func (w *Worker) spawnSinkMount(parent context.Context, mount sinkMount, produce
 			return fmt.Errorf("connect: sink %q task %d init: %w", mount.connector.Name(), i, err)
 		}
 		w.wg.Add(1)
-		go w.runSinkTask(mountCtx, mount, task, producer)
+		go w.runSinkTask(mountCtx, mount, i, task, producer)
 	}
 	return nil
 }
@@ -536,19 +614,47 @@ func (w *Worker) runSourceTask(ctx context.Context, name string, taskIndex int, 
 				continue
 			}
 		}
-		for _, sr := range records {
+		// Track how many records the broker actually accepted so a
+		// mid-batch cancellation can still persist offsets for
+		// records that landed. Without this, a Stop fired between
+		// Send #N and Send #N+1 would leave records 1..N on the
+		// broker unacknowledged in the offset store — a restart
+		// would re-emit them as duplicates.
+		sentCount := 0
+		var sendErr error
+		stats := w.counters(name, taskIndex)
+		for i, sr := range records {
 			rec := proto.Record{
 				Key:     sr.Key,
 				Value:   sr.Value,
 				Headers: sr.Headers,
 			}
 			if _, err := producer.Send(ctx, sr.Topic, rec); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return
-				}
-				w.recordErr(fmt.Errorf("source %q produce: %w", name, err))
+				sendErr = err
+				sentCount = i
+				break
+			}
+			stats.records.Add(1)
+			stats.bytes.Add(int64(len(sr.Value)))
+		}
+		if sendErr == nil {
+			sentCount = len(records)
+		}
+
+		// Persist offsets for records that DID land on the broker,
+		// even if the surrounding context is cancelled. Save with a
+		// fresh ctx in that case so the in-memory offset store
+		// (which is the test's failure mode) sees the write.
+		if sentCount > 0 {
+			w.saveSourceOffsetsBestEffort(ctx, name, taskIndex, records[:sentCount])
+		}
+
+		if sendErr != nil {
+			if errors.Is(sendErr, context.Canceled) {
 				return
 			}
+			w.recordErr(fmt.Errorf("source %q produce: %w", name, sendErr))
+			return
 		}
 		if err := task.Commit(ctx, records); err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -557,27 +663,43 @@ func (w *Worker) runSourceTask(ctx context.Context, name string, taskIndex int, 
 			w.recordErr(fmt.Errorf("source %q commit: %w", name, err))
 			return
 		}
-		if w.offsetStore != nil {
-			offsets := make([]map[string]any, 0, len(records))
-			for _, sr := range records {
-				if sr.SourceOffset != nil {
-					offsets = append(offsets, sr.SourceOffset)
-				}
-			}
-			if len(offsets) > 0 {
-				if err := w.offsetStore.Save(ctx, name, taskIndex, offsets); err != nil {
-					w.recordErr(fmt.Errorf("source %q offset save: %w", name, err))
-					return
-				}
-			}
-		}
 	}
 }
 
-func (w *Worker) runSinkTask(ctx context.Context, mount sinkMount, task SinkTask, producer *sdk.Producer) {
+// saveSourceOffsetsBestEffort persists offsets for records that
+// reached the broker, even when the surrounding ctx is cancelled.
+// Falls back to a fresh background context with a short timeout
+// so a Stop mid-batch doesn't lose the durability boundary that
+// keeps a restart from re-emitting already-delivered records.
+func (w *Worker) saveSourceOffsetsBestEffort(ctx context.Context, name string, taskIndex int, records []SourceRecord) {
+	if w.offsetStore == nil {
+		return
+	}
+	offsets := make([]map[string]any, 0, len(records))
+	for _, sr := range records {
+		if sr.SourceOffset != nil {
+			offsets = append(offsets, sr.SourceOffset)
+		}
+	}
+	if len(offsets) == 0 {
+		return
+	}
+	saveCtx := ctx
+	if saveCtx.Err() != nil {
+		var cancel context.CancelFunc
+		saveCtx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+	}
+	if err := w.offsetStore.Save(saveCtx, name, taskIndex, offsets); err != nil {
+		w.recordErr(fmt.Errorf("source %q offset save: %w", name, err))
+	}
+}
+
+func (w *Worker) runSinkTask(ctx context.Context, mount sinkMount, taskIndex int, task SinkTask, producer *sdk.Producer) {
 	defer w.wg.Done()
 	defer task.Close()
 	conn := mount.connector
+	stats := w.counters(conn.Name(), taskIndex)
 
 	// Pre-rebalance flush+commit. Fired before the consumer loses its
 	// current partitions; flushes the sink and commits offsets so the
@@ -661,6 +783,13 @@ func (w *Worker) runSinkTask(ctx context.Context, mount sinkMount, task SinkTask
 					w.recordErr(fmt.Errorf("sink %q dlq %q: %w", conn.Name(), mount.dlqTopic, dlqErr))
 					return
 				}
+			}
+			// Successful put (or DLQ-redirected): count records as
+			// processed. Each record's value-byte count contributes
+			// to the per-task bytes counter.
+			stats.records.Add(int64(len(records)))
+			for _, r := range records {
+				stats.bytes.Add(int64(len(r.Value)))
 			}
 		}
 

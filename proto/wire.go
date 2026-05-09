@@ -28,7 +28,17 @@ var wireCRCTable = crc32.MakeTable(crc32.Castagnoli)
 //	    Codec byte so brokers can ship records LZ4-compressed when the
 //	    client signals support, symmetric with the produce-side codec
 //	    introduced in v2.
-const WireVersion uint8 = 5
+//	v6: HeartbeatRequest carries a MaxWaitMs field so the broker can
+//	    long-poll the heartbeat — holding the response open until a
+//	    rebalance is needed or the deadline elapses, delivering the
+//	    server-pushed rebalance signal that closes the
+//	    duplicate-production window during rebalance.
+//	v7: PartitionSnapshot replaced by chunked ListSegments +
+//	    FetchSegmentChunk so large partitions don't OOM the broker
+//	    on a single response, and the donor's active segment is
+//	    safely included in the snapshot via byte-range reads bounded
+//	    by the size captured at list time.
+const WireVersion uint8 = 7
 
 // OpCode names a request type. Responses echo the same opcode.
 type OpCode uint8
@@ -49,6 +59,42 @@ const (
 	OpClusterMembers  OpCode = 0x0D
 	OpAddVoter        OpCode = 0x0E
 	OpRemoveVoter     OpCode = 0x0F
+	// OpListSegments returns metadata for every segment in a
+	// partition — base offset and current (.log, .idx) sizes —
+	// captured under the partition's mutex so subsequent
+	// FetchSegmentChunk calls can read a self-consistent prefix even
+	// while the active segment is being appended to.
+	OpListSegments OpCode = 0x10
+	// OpFetchSegmentChunk returns a byte range from a specific
+	// segment file. Pairs with OpListSegments to ship segments to a
+	// brand-new follower in bounded-memory chunks.
+	OpFetchSegmentChunk OpCode = 0x11
+	// OpDeleteTopic removes a topic and every partition's records.
+	// Replicated through Raft on a clustered broker; on a single
+	// broker the registry and storage are updated directly.
+	OpDeleteTopic OpCode = 0x12
+	// OpListTopics returns the broker's full topic registry —
+	// every TopicConfig the broker currently knows about. Replaces
+	// the probe-by-name workaround the CLI used pre-batch-23.
+	OpListTopics OpCode = 0x13
+	// OpListGroups returns a summary (name, generation, member
+	// count, subscribed topics) of every consumer group registered
+	// with the manager.
+	OpListGroups OpCode = 0x14
+	// OpDescribeGroup returns per-member partition assignments for
+	// a single named group.
+	OpDescribeGroup OpCode = 0x15
+	// OpClusterStatus reports leader info — leader ID, leader's
+	// Raft RPC address, and whether the responding broker is the
+	// leader. Pairs with OpClusterMembers (which returns member
+	// metadata only) so an operator can see the full picture in
+	// one CLI invocation.
+	OpClusterStatus OpCode = 0x16
+	// OpUpdateTopicConfig changes the retention and segment-size
+	// settings of an existing topic. Partition count is immutable
+	// (changing it would break ordering invariants); only soft
+	// configuration knobs are updatable.
+	OpUpdateTopicConfig OpCode = 0x17
 )
 
 // Status is the first byte of every response body.
@@ -65,6 +111,7 @@ const (
 	StatusRebalanceNeeded  Status = 0x31
 	StatusNotLeader        Status = 0x40
 	StatusUnauthorized     Status = 0x50
+	StatusForbidden        Status = 0x51
 	StatusRateLimited      Status = 0x60
 	StatusInternal         Status = 0xFF
 )
@@ -625,6 +672,152 @@ func DecodeHighWaterResponse(b []byte) (HighWaterResponse, error) {
 	return HighWaterResponse{HighWater: int64(binary.BigEndian.Uint64(b[:8]))}, nil
 }
 
+// SegmentKind tags which file of a segment is being addressed in
+// FetchSegmentChunk: the .log (the records) or the .idx (the sparse
+// index). Mapped to a single byte over the wire.
+type SegmentKind uint8
+
+const (
+	// SegmentLog addresses the segment's .log file (record bytes).
+	SegmentLog SegmentKind = 0
+	// SegmentIdx addresses the segment's .idx file (sparse index).
+	SegmentIdx SegmentKind = 1
+)
+
+// SegmentInfo describes a single segment in a partition: its base
+// offset and the current sizes of the .log and .idx files. Sizes are
+// captured under the partition's mutex when the broker assembles a
+// ListSegmentsResponse so a follower can read a self-consistent
+// prefix of every segment — including the active one — bounded by
+// the listed sizes.
+type SegmentInfo struct {
+	Base    int64
+	LogSize int64
+	IdxSize int64
+}
+
+// ListSegmentsRequest asks the broker for the segment manifest of a
+// partition.
+type ListSegmentsRequest struct {
+	Topic     string
+	Partition int32
+}
+
+func (r ListSegmentsRequest) Encode() []byte {
+	b := encodeString(nil, r.Topic)
+	return binary.BigEndian.AppendUint32(b, uint32(r.Partition))
+}
+
+func DecodeListSegmentsRequest(b []byte) (ListSegmentsRequest, error) {
+	topic, off, err := decodeString(b)
+	if err != nil {
+		return ListSegmentsRequest{}, err
+	}
+	if len(b)-off < 4 {
+		return ListSegmentsRequest{}, errors.New("proto: short ListSegmentsRequest")
+	}
+	return ListSegmentsRequest{
+		Topic:     topic,
+		Partition: int32(binary.BigEndian.Uint32(b[off : off+4])),
+	}, nil
+}
+
+// ListSegmentsResponse carries the segment manifest. Segments appear
+// in ascending base-offset order; the highest-base segment is the
+// donor's currently active segment.
+type ListSegmentsResponse struct {
+	Segments []SegmentInfo
+}
+
+func (r ListSegmentsResponse) Encode() []byte {
+	b := binary.BigEndian.AppendUint32(nil, uint32(len(r.Segments)))
+	for _, s := range r.Segments {
+		b = binary.BigEndian.AppendUint64(b, uint64(s.Base))
+		b = binary.BigEndian.AppendUint64(b, uint64(s.LogSize))
+		b = binary.BigEndian.AppendUint64(b, uint64(s.IdxSize))
+	}
+	return b
+}
+
+func DecodeListSegmentsResponse(b []byte) (ListSegmentsResponse, error) {
+	if len(b) < 4 {
+		return ListSegmentsResponse{}, errors.New("proto: short ListSegmentsResponse")
+	}
+	count := int(binary.BigEndian.Uint32(b[:4]))
+	b = b[4:]
+	if len(b) < count*24 {
+		return ListSegmentsResponse{}, errors.New("proto: short ListSegmentsResponse entries")
+	}
+	out := make([]SegmentInfo, 0, count)
+	for range count {
+		out = append(out, SegmentInfo{
+			Base:    int64(binary.BigEndian.Uint64(b[0:8])),
+			LogSize: int64(binary.BigEndian.Uint64(b[8:16])),
+			IdxSize: int64(binary.BigEndian.Uint64(b[16:24])),
+		})
+		b = b[24:]
+	}
+	return ListSegmentsResponse{Segments: out}, nil
+}
+
+// FetchSegmentChunkRequest reads a byte range from one segment file.
+// Callers pair Base + Kind to address the file; (Offset, MaxBytes)
+// bounds the read. The broker returns up to MaxBytes; fewer bytes
+// signal end-of-file at the listed size.
+type FetchSegmentChunkRequest struct {
+	Topic     string
+	Partition int32
+	Base      int64
+	Kind      SegmentKind
+	Offset    int64
+	MaxBytes  int32
+}
+
+func (r FetchSegmentChunkRequest) Encode() []byte {
+	b := encodeString(nil, r.Topic)
+	b = binary.BigEndian.AppendUint32(b, uint32(r.Partition))
+	b = binary.BigEndian.AppendUint64(b, uint64(r.Base))
+	b = append(b, byte(r.Kind))
+	b = binary.BigEndian.AppendUint64(b, uint64(r.Offset))
+	return binary.BigEndian.AppendUint32(b, uint32(r.MaxBytes))
+}
+
+func DecodeFetchSegmentChunkRequest(b []byte) (FetchSegmentChunkRequest, error) {
+	topic, off, err := decodeString(b)
+	if err != nil {
+		return FetchSegmentChunkRequest{}, err
+	}
+	b = b[off:]
+	if len(b) < 4+8+1+8+4 {
+		return FetchSegmentChunkRequest{}, errors.New("proto: short FetchSegmentChunkRequest")
+	}
+	return FetchSegmentChunkRequest{
+		Topic:     topic,
+		Partition: int32(binary.BigEndian.Uint32(b[0:4])),
+		Base:      int64(binary.BigEndian.Uint64(b[4:12])),
+		Kind:      SegmentKind(b[12]),
+		Offset:    int64(binary.BigEndian.Uint64(b[13:21])),
+		MaxBytes:  int32(binary.BigEndian.Uint32(b[21:25])),
+	}, nil
+}
+
+// FetchSegmentChunkResponse carries the requested byte range.
+type FetchSegmentChunkResponse struct {
+	Bytes []byte
+}
+
+func (r FetchSegmentChunkResponse) Encode() []byte {
+	return encodeBytes(nil, r.Bytes)
+}
+
+func DecodeFetchSegmentChunkResponse(b []byte) (FetchSegmentChunkResponse, error) {
+	bytes, _, err := decodeBytes(b)
+	if err != nil {
+		return FetchSegmentChunkResponse{}, err
+	}
+	return FetchSegmentChunkResponse{Bytes: bytes}, nil
+}
+
 // ClusterMember pairs a voter ID with its Raft RPC address.
 type ClusterMember struct {
 	ID   string
@@ -746,6 +939,354 @@ func DecodeCreateTopicRequest(b []byte) (CreateTopicRequest, error) {
 		RetentionMs:    int64(binary.BigEndian.Uint64(b[4:12])),
 		SegmentBytes:   int64(binary.BigEndian.Uint64(b[12:20])),
 	}, nil
+}
+
+// ClusterStatusRequest asks the broker to report its Raft leader
+// info. Request body is empty.
+type ClusterStatusRequest struct{}
+
+func (r ClusterStatusRequest) Encode() []byte { return nil }
+
+func DecodeClusterStatusRequest(_ []byte) (ClusterStatusRequest, error) {
+	return ClusterStatusRequest{}, nil
+}
+
+// ClusterStatusResponse carries the responding broker's Raft
+// leader view. NodeID is this broker's node ID; IsLeader reports
+// whether it currently holds leadership; LeaderID/LeaderAddr name
+// the leader the broker last observed (may be empty during an
+// election or when this broker isn't part of a cluster).
+type ClusterStatusResponse struct {
+	NodeID     string
+	IsLeader   bool
+	LeaderID   string
+	LeaderAddr string
+}
+
+func (r ClusterStatusResponse) Encode() []byte {
+	b := encodeString(nil, r.NodeID)
+	if r.IsLeader {
+		b = append(b, 1)
+	} else {
+		b = append(b, 0)
+	}
+	b = encodeString(b, r.LeaderID)
+	return encodeString(b, r.LeaderAddr)
+}
+
+func DecodeClusterStatusResponse(b []byte) (ClusterStatusResponse, error) {
+	nodeID, n, err := decodeString(b)
+	if err != nil {
+		return ClusterStatusResponse{}, err
+	}
+	b = b[n:]
+	if len(b) < 1 {
+		return ClusterStatusResponse{}, errors.New("proto: short ClusterStatusResponse")
+	}
+	isLeader := b[0] != 0
+	b = b[1:]
+	leaderID, n, err := decodeString(b)
+	if err != nil {
+		return ClusterStatusResponse{}, err
+	}
+	b = b[n:]
+	leaderAddr, _, err := decodeString(b)
+	if err != nil {
+		return ClusterStatusResponse{}, err
+	}
+	return ClusterStatusResponse{
+		NodeID: nodeID, IsLeader: isLeader,
+		LeaderID: leaderID, LeaderAddr: leaderAddr,
+	}, nil
+}
+
+// ListGroupsRequest enumerates every consumer group the manager
+// knows about. Request body is empty.
+type ListGroupsRequest struct{}
+
+func (r ListGroupsRequest) Encode() []byte { return nil }
+
+func DecodeListGroupsRequest(_ []byte) (ListGroupsRequest, error) {
+	return ListGroupsRequest{}, nil
+}
+
+// GroupSummary is one entry in a ListGroupsResponse.
+type GroupSummary struct {
+	Name        string
+	Generation  int32
+	MemberCount int32
+	Topics      []string
+}
+
+// ListGroupsResponse carries a summary of every consumer group.
+type ListGroupsResponse struct {
+	Groups []GroupSummary
+}
+
+func (r ListGroupsResponse) Encode() []byte {
+	b := binary.BigEndian.AppendUint32(nil, uint32(len(r.Groups)))
+	for _, g := range r.Groups {
+		b = encodeString(b, g.Name)
+		b = binary.BigEndian.AppendUint32(b, uint32(g.Generation))
+		b = binary.BigEndian.AppendUint32(b, uint32(g.MemberCount))
+		b = binary.BigEndian.AppendUint32(b, uint32(len(g.Topics)))
+		for _, t := range g.Topics {
+			b = encodeString(b, t)
+		}
+	}
+	return b
+}
+
+func DecodeListGroupsResponse(b []byte) (ListGroupsResponse, error) {
+	if len(b) < 4 {
+		return ListGroupsResponse{}, errors.New("proto: short ListGroupsResponse")
+	}
+	count := int(binary.BigEndian.Uint32(b[:4]))
+	b = b[4:]
+	out := make([]GroupSummary, 0, count)
+	for range count {
+		name, n, err := decodeString(b)
+		if err != nil {
+			return ListGroupsResponse{}, err
+		}
+		b = b[n:]
+		if len(b) < 12 {
+			return ListGroupsResponse{}, errors.New("proto: short ListGroupsResponse entry")
+		}
+		gen := int32(binary.BigEndian.Uint32(b[0:4]))
+		members := int32(binary.BigEndian.Uint32(b[4:8]))
+		topicCount := int(binary.BigEndian.Uint32(b[8:12]))
+		b = b[12:]
+		topics := make([]string, 0, topicCount)
+		for range topicCount {
+			t, n2, err := decodeString(b)
+			if err != nil {
+				return ListGroupsResponse{}, err
+			}
+			topics = append(topics, t)
+			b = b[n2:]
+		}
+		out = append(out, GroupSummary{
+			Name: name, Generation: gen, MemberCount: members, Topics: topics,
+		})
+	}
+	return ListGroupsResponse{Groups: out}, nil
+}
+
+// DescribeGroupRequest names the group to describe.
+type DescribeGroupRequest struct {
+	Group string
+}
+
+func (r DescribeGroupRequest) Encode() []byte {
+	return encodeString(nil, r.Group)
+}
+
+func DecodeDescribeGroupRequest(b []byte) (DescribeGroupRequest, error) {
+	g, _, err := decodeString(b)
+	if err != nil {
+		return DescribeGroupRequest{}, err
+	}
+	return DescribeGroupRequest{Group: g}, nil
+}
+
+// MemberAssignment is one member's partition list in a group.
+type MemberAssignment struct {
+	MemberID   string
+	Partitions []PartitionRef
+}
+
+// DescribeGroupResponse carries per-member assignments for one
+// group plus the group's current generation and subscribed topics.
+type DescribeGroupResponse struct {
+	Name       string
+	Generation int32
+	Topics     []string
+	Members    []MemberAssignment
+}
+
+func (r DescribeGroupResponse) Encode() []byte {
+	b := encodeString(nil, r.Name)
+	b = binary.BigEndian.AppendUint32(b, uint32(r.Generation))
+	b = binary.BigEndian.AppendUint32(b, uint32(len(r.Topics)))
+	for _, t := range r.Topics {
+		b = encodeString(b, t)
+	}
+	b = binary.BigEndian.AppendUint32(b, uint32(len(r.Members)))
+	for _, m := range r.Members {
+		b = encodeString(b, m.MemberID)
+		b = binary.BigEndian.AppendUint32(b, uint32(len(m.Partitions)))
+		for _, p := range m.Partitions {
+			b = encodeString(b, p.Topic)
+			b = binary.BigEndian.AppendUint32(b, uint32(p.Index))
+		}
+	}
+	return b
+}
+
+func DecodeDescribeGroupResponse(b []byte) (DescribeGroupResponse, error) {
+	name, n, err := decodeString(b)
+	if err != nil {
+		return DescribeGroupResponse{}, err
+	}
+	b = b[n:]
+	if len(b) < 8 {
+		return DescribeGroupResponse{}, errors.New("proto: short DescribeGroupResponse")
+	}
+	gen := int32(binary.BigEndian.Uint32(b[0:4]))
+	topicCount := int(binary.BigEndian.Uint32(b[4:8]))
+	b = b[8:]
+	topics := make([]string, 0, topicCount)
+	for range topicCount {
+		t, n2, err := decodeString(b)
+		if err != nil {
+			return DescribeGroupResponse{}, err
+		}
+		topics = append(topics, t)
+		b = b[n2:]
+	}
+	if len(b) < 4 {
+		return DescribeGroupResponse{}, errors.New("proto: short DescribeGroupResponse members")
+	}
+	memberCount := int(binary.BigEndian.Uint32(b[:4]))
+	b = b[4:]
+	members := make([]MemberAssignment, 0, memberCount)
+	for range memberCount {
+		id, n2, err := decodeString(b)
+		if err != nil {
+			return DescribeGroupResponse{}, err
+		}
+		b = b[n2:]
+		if len(b) < 4 {
+			return DescribeGroupResponse{}, errors.New("proto: short DescribeGroupResponse partition count")
+		}
+		pcount := int(binary.BigEndian.Uint32(b[:4]))
+		b = b[4:]
+		parts := make([]PartitionRef, 0, pcount)
+		for range pcount {
+			pt, n3, err := decodeString(b)
+			if err != nil {
+				return DescribeGroupResponse{}, err
+			}
+			b = b[n3:]
+			if len(b) < 4 {
+				return DescribeGroupResponse{}, errors.New("proto: short DescribeGroupResponse partition")
+			}
+			parts = append(parts, PartitionRef{
+				Topic: pt,
+				Index: int32(binary.BigEndian.Uint32(b[:4])),
+			})
+			b = b[4:]
+		}
+		members = append(members, MemberAssignment{MemberID: id, Partitions: parts})
+	}
+	return DescribeGroupResponse{
+		Name: name, Generation: gen, Topics: topics, Members: members,
+	}, nil
+}
+
+// ListTopicsRequest enumerates every topic the broker knows about.
+// The request body is empty.
+type ListTopicsRequest struct{}
+
+func (r ListTopicsRequest) Encode() []byte { return nil }
+
+func DecodeListTopicsRequest(_ []byte) (ListTopicsRequest, error) {
+	return ListTopicsRequest{}, nil
+}
+
+// ListTopicsResponse carries every TopicConfig in the broker's
+// registry. Order is unspecified.
+type ListTopicsResponse struct {
+	Topics []TopicConfig
+}
+
+func (r ListTopicsResponse) Encode() []byte {
+	b := binary.BigEndian.AppendUint32(nil, uint32(len(r.Topics)))
+	for _, t := range r.Topics {
+		b = encodeString(b, t.Name)
+		b = binary.BigEndian.AppendUint32(b, uint32(t.PartitionCount))
+		b = binary.BigEndian.AppendUint64(b, uint64(t.RetentionMs))
+		b = binary.BigEndian.AppendUint64(b, uint64(t.SegmentBytes))
+	}
+	return b
+}
+
+func DecodeListTopicsResponse(b []byte) (ListTopicsResponse, error) {
+	if len(b) < 4 {
+		return ListTopicsResponse{}, errors.New("proto: short ListTopicsResponse")
+	}
+	count := int(binary.BigEndian.Uint32(b[:4]))
+	b = b[4:]
+	out := make([]TopicConfig, 0, count)
+	for range count {
+		name, n, err := decodeString(b)
+		if err != nil {
+			return ListTopicsResponse{}, err
+		}
+		b = b[n:]
+		if len(b) < 20 {
+			return ListTopicsResponse{}, errors.New("proto: short ListTopicsResponse entry")
+		}
+		out = append(out, TopicConfig{
+			Name:           name,
+			PartitionCount: int32(binary.BigEndian.Uint32(b[0:4])),
+			RetentionMs:    int64(binary.BigEndian.Uint64(b[4:12])),
+			SegmentBytes:   int64(binary.BigEndian.Uint64(b[12:20])),
+		})
+		b = b[20:]
+	}
+	return ListTopicsResponse{Topics: out}, nil
+}
+
+// UpdateTopicConfigRequest changes a topic's retention and
+// segment-size settings without recreating it. PartitionCount is
+// not modifiable — changing it would break per-partition ordering
+// invariants for already-produced records.
+type UpdateTopicConfigRequest struct {
+	Name         string
+	RetentionMs  int64
+	SegmentBytes int64
+}
+
+func (r UpdateTopicConfigRequest) Encode() []byte {
+	b := encodeString(nil, r.Name)
+	b = binary.BigEndian.AppendUint64(b, uint64(r.RetentionMs))
+	return binary.BigEndian.AppendUint64(b, uint64(r.SegmentBytes))
+}
+
+func DecodeUpdateTopicConfigRequest(b []byte) (UpdateTopicConfigRequest, error) {
+	name, n, err := decodeString(b)
+	if err != nil {
+		return UpdateTopicConfigRequest{}, err
+	}
+	b = b[n:]
+	if len(b) < 16 {
+		return UpdateTopicConfigRequest{}, errors.New("proto: short UpdateTopicConfigRequest")
+	}
+	return UpdateTopicConfigRequest{
+		Name:         name,
+		RetentionMs:  int64(binary.BigEndian.Uint64(b[0:8])),
+		SegmentBytes: int64(binary.BigEndian.Uint64(b[8:16])),
+	}, nil
+}
+
+// DeleteTopicRequest removes a topic and every record on it. The
+// response body is empty (status-only).
+type DeleteTopicRequest struct {
+	Name string
+}
+
+func (r DeleteTopicRequest) Encode() []byte {
+	return encodeString(nil, r.Name)
+}
+
+func DecodeDeleteTopicRequest(b []byte) (DeleteTopicRequest, error) {
+	name, _, err := decodeString(b)
+	if err != nil {
+		return DeleteTopicRequest{}, err
+	}
+	return DeleteTopicRequest{Name: name}, nil
 }
 
 // CommitRequest is a no-op through Stage 3.
@@ -892,16 +1433,24 @@ func DecodeJoinGroupResponse(b []byte) (JoinGroupResponse, error) {
 }
 
 // HeartbeatRequest reports liveness for memberID in groupName.
+//
+// MaxWaitMs > 0 turns the call into a long-poll: the broker holds
+// the response open for up to MaxWaitMs milliseconds, returning
+// immediately when a rebalance is needed. MaxWaitMs == 0 preserves
+// the historical fire-and-forget semantic where the response is
+// returned on receipt.
 type HeartbeatRequest struct {
 	Group      string
 	MemberID   string
 	Generation int32
+	MaxWaitMs  int32
 }
 
 func (r HeartbeatRequest) Encode() []byte {
 	b := encodeString(nil, r.Group)
 	b = encodeString(b, r.MemberID)
 	b = binary.BigEndian.AppendUint32(b, uint32(r.Generation))
+	b = binary.BigEndian.AppendUint32(b, uint32(r.MaxWaitMs))
 	return b
 }
 
@@ -916,13 +1465,14 @@ func DecodeHeartbeatRequest(b []byte) (HeartbeatRequest, error) {
 		return HeartbeatRequest{}, err
 	}
 	b = b[n:]
-	if len(b) < 4 {
+	if len(b) < 8 {
 		return HeartbeatRequest{}, errors.New("proto: short HeartbeatRequest")
 	}
 	return HeartbeatRequest{
 		Group:      group,
 		MemberID:   member,
 		Generation: int32(binary.BigEndian.Uint32(b[:4])),
+		MaxWaitMs:  int32(binary.BigEndian.Uint32(b[4:8])),
 	}, nil
 }
 

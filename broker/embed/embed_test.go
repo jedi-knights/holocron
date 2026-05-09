@@ -12,6 +12,8 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -715,6 +717,384 @@ func TestListen_APIKey_RejectsMissing(t *testing.T) {
 	}
 }
 
+// TestConsumer_PauseResume proves Pause halts fetching from a
+// partition (records produced while paused don't arrive) and
+// Resume picks up from the offset just past the last record the
+// consumer saw. Useful for backpressure-aware sinks.
+func TestConsumer_PauseResume(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	prod, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p := proto.PartitionRef{Topic: "events", Index: 0}
+	if err := c.Assign(ctx, p, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act + Assert — produce one record and read it.
+	if _, err := prod.Send(ctx, "events", proto.Record{Value: []byte("v0")}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Poll(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || string(got[0].Value) != "v0" {
+		t.Fatalf("first poll: got %v, want one v0", got)
+	}
+
+	// Pause and produce more — should not arrive.
+	if err := c.Pause(p); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"v1", "v2"} {
+		if _, err := prod.Send(ctx, "events", proto.Record{Value: []byte(v)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	got, _ = c.Poll(pollCtx, 5)
+	pollCancel()
+	if len(got) > 0 {
+		t.Fatalf("paused poll got %d records, want 0", len(got))
+	}
+
+	// Resume — the two records produced while paused should now
+	// arrive, in order, starting at offset 1.
+	if err := c.Resume(ctx, p, 0); err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	for len(got) < 2 {
+		recs, err := c.Poll(ctx, 2-len(got))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, recs...)
+	}
+	if string(got[0].Value) != "v1" || string(got[1].Value) != "v2" {
+		t.Errorf("resume reads: got %q,%q, want v1,v2", got[0].Value, got[1].Value)
+	}
+}
+
+// TestProducer_IdempotentDedupSurvivesBrokerRestart proves the
+// broker's dedup table persists across restart on a disk broker:
+// a record produced with (producer-id, seq=0), then a fresh broker
+// process opening the same data dir, then a retry of the same
+// (producer-id, seq=0) — the retry returns the original offset
+// rather than appending a duplicate.
+//
+// Without persistence (batch 23's in-memory-only state) the broker
+// would forget the checkpoint on restart and the retry would land
+// at offset 1, breaking exactly-once semantics across restarts.
+func TestProducer_IdempotentDedupSurvivesBrokerRestart(t *testing.T) {
+	// Arrange — disk broker on a temp data dir.
+	dir := t.TempDir()
+	b, err := embed.NewDisk(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	withProducer := func(id string, seq uint64, value string) proto.Record {
+		var seqBytes [8]byte
+		for i := 7; i >= 0; i-- {
+			seqBytes[i] = byte(seq)
+			seq >>= 8
+		}
+		return proto.Record{
+			Value: []byte(value),
+			Headers: []proto.Header{
+				{Key: proto.HeaderProducerID, Value: []byte(id)},
+				{Key: proto.HeaderProducerSeq, Value: seqBytes[:]},
+			},
+		}
+	}
+
+	prod1, err := sdk.NewProducer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	off, err := prod1.Send(ctx, "events", withProducer("producer-A", 0, "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != 0 {
+		t.Fatalf("first publish: got offset %d, want 0", off)
+	}
+	_ = prod1.Close()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act — fresh broker over the same data dir.
+	b2, err := embed.NewDisk(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b2.Close()
+	prod2, err := sdk.NewProducer(b2.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod2.Close()
+
+	off2, err := prod2.Send(ctx, "events", withProducer("producer-A", 0, "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert — the retry returns the original offset (dedup persisted).
+	if off2 != 0 {
+		t.Errorf("retry across restart: got offset %d, want 0 — dedup state did not persist", off2)
+	}
+}
+
+// TestProducer_IdempotentRetryDeduplicates proves the end-to-end
+// idempotent-retry path: a Producer constructed with
+// WithIdempotency stamps each record with a producer ID + sequence
+// number, and the broker dedups retries of an already-applied
+// write. The test simulates a retry by calling Send twice with the
+// same payload after manually rewinding the producer's per-
+// partition sequence counter.
+//
+// Without this, even with WithIdempotency on, a retry would land
+// at a fresh offset and consumers would see two records.
+func TestProducer_IdempotentRetryDeduplicates(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	prod, err := sdk.NewProducer(b.Transport(), sdk.WithIdempotency())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Act — first send lands at offset 0.
+	off0, err := prod.Send(ctx, "events", proto.Record{Value: []byte("v0")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off0 != 0 {
+		t.Fatalf("first send: got offset %d, want 0", off0)
+	}
+
+	// Simulate a retry: rewind the producer's seq counter for this
+	// partition and re-send the same record. The broker should
+	// recognize the duplicate (matching producer-id + sequence) and
+	// return the original offset.
+	prod.RewindIdempotencySequence(proto.PartitionRef{Topic: "events", Index: 0})
+	off0Retry, err := prod.Send(ctx, "events", proto.Record{Value: []byte("v0")})
+	if err != nil {
+		t.Fatalf("retry send: %v", err)
+	}
+	if off0Retry != 0 {
+		t.Errorf("retry send: got offset %d, want 0 (broker dedup failed)", off0Retry)
+	}
+
+	// A fresh send (now at seq 1 again, which is past the retry's
+	// rewound seq) lands at offset 1.
+	off1, err := prod.Send(ctx, "events", proto.Record{Value: []byte("v1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off1 != 1 {
+		t.Fatalf("fresh send: got offset %d, want 1", off1)
+	}
+
+	// Assert — only two records in the partition (offset 0 and 1).
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Subscribe(ctx, "events", 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Poll(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("partition contents: got %d records, want 2 (dedup failed)", len(got))
+	}
+}
+
+// TestDeleteTopic_ClearsRecordsAndAllowsReuse proves a deleted
+// topic's records vanish from disk and a re-created topic of the
+// same name starts fresh at offset 0. Without this, holocron has
+// no inverse for CreateTopic — operationally a glaring gap.
+func TestDeleteTopic_ClearsRecordsAndAllowsReuse(t *testing.T) {
+	// Arrange — disk broker so we can verify the on-disk dir is gone.
+	dir := t.TempDir()
+	b, err := embed.NewDisk(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "ephemeral", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	addr, err := b.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := holocronnet.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Produce two records.
+	prod, err := sdk.NewProducer(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	for i := range 2 {
+		if _, err := prod.Send(ctx, "ephemeral", proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Act — delete the topic.
+	if err := tr.DeleteTopic(ctx, "ephemeral"); err != nil {
+		t.Fatalf("DeleteTopic: %v", err)
+	}
+
+	// Assert — the on-disk topic dir is gone.
+	if _, err := os.Stat(filepath.Join(dir, "ephemeral")); !os.IsNotExist(err) {
+		t.Errorf("data dir still exists after delete: %v", err)
+	}
+
+	// Re-creating the topic and producing should succeed; the new
+	// records should start at offset 0 (no historical data).
+	if err := tr.CreateTopic(ctx, "ephemeral", 1); err != nil {
+		t.Fatalf("recreate after delete: %v", err)
+	}
+	off, err := prod.Send(ctx, "ephemeral", proto.Record{Value: []byte("fresh")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != 0 {
+		t.Errorf("first offset after delete + recreate: got %d, want 0", off)
+	}
+}
+
+// TestACL_EnforcesPerTopicPermissions proves the per-topic
+// authorization layer: a key restricted to {Produce: ["allowed"]}
+// can publish to "allowed", but produces to "other" and consumes
+// from "allowed" both fail with a forbidden error.
+//
+// Authentication (WithAPIKeys) gates which keys can connect at all;
+// authorization (WithACL) gates what each key can do once admitted.
+// Without this layer, a single API key would have full access to
+// every topic.
+func TestACL_EnforcesPerTopicPermissions(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "allowed", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CreateTopic(embed.TopicSpec{Name: "other", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	addr, err := b.Listen("127.0.0.1:0",
+		embed.WithAPIKeys("k1"),
+		embed.WithACL(map[string]embed.ACL{
+			"k1": {Produce: []string{"allowed"}},
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tr, err := holocronnet.Dial(addr, holocronnet.WithAPIKey("k1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Act + Assert — produce to allowed: succeeds.
+	prod, err := sdk.NewProducer(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	if _, err := prod.Send(ctx, "allowed", proto.Record{Value: []byte("ok")}); err != nil {
+		t.Fatalf("produce to allowed topic: %v", err)
+	}
+
+	// Produce to other: forbidden.
+	if _, err := prod.Send(ctx, "other", proto.Record{Value: []byte("nope")}); err == nil {
+		t.Fatal("produce to non-permitted topic succeeded — ACL not enforced")
+	}
+
+	// Consume from allowed: forbidden (no consume permission).
+	c, err := sdk.NewConsumer(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Subscribe(ctx, "allowed", 0); err != nil {
+		// Subscribe itself may succeed (it's metadata-only); the
+		// poll is where the fetch fires.
+		if !isForbidden(err) {
+			t.Fatalf("expected forbidden on subscribe, got %v", err)
+		}
+		return
+	}
+	if _, err := c.Poll(ctx, 1); err == nil || !isForbidden(err) {
+		t.Fatalf("expected forbidden on consume, got %v", err)
+	}
+}
+
+// isForbidden reports whether err is a wire-protocol forbidden
+// status. Used in ACL tests to distinguish authorization failures
+// from other RPC errors.
+func isForbidden(err error) bool {
+	var pe *proto.ProtocolError
+	if !errors.As(err, &pe) {
+		return false
+	}
+	return pe.Status == proto.StatusForbidden
+}
+
 // TestListenMetrics_ScrapeAfterProduce: produce a record, scrape
 // /metrics, verify the produced counter advanced.
 func TestListenMetrics_ScrapeAfterProduce(t *testing.T) {
@@ -1110,5 +1490,306 @@ func TestNetwork_HighWater_RoundTrip(t *testing.T) {
 	}
 	if hw != 3 {
 		t.Errorf("HighWater after 3 produces: got %d, want 3", hw)
+	}
+}
+
+// TestHeartbeat_LongPollPushedRebalance proves the server-pushed
+// rebalance signal: an existing group member running a long-poll
+// heartbeat receives RebalanceNeeded the moment a peer joins,
+// without waiting for the next ticker interval.
+//
+// The consumer's heartbeat interval (which is also the long-poll
+// deadline) is 5 seconds. A peer joins at T+50ms. The first member's
+// AssignFunc fires twice — once on Subscribe, once after the
+// rebalance — and the second fire must arrive far before the
+// 5-second deadline. Without server push the second fire would
+// only happen after the 5s heartbeat tick.
+func TestHeartbeat_LongPollPushedRebalance(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 4}); err != nil {
+		t.Fatal(err)
+	}
+	addr, err := b.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tr1, err := holocronnet.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr1.Close()
+	tr2, err := holocronnet.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr2.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// reassigned fires every time c1's group assignment changes.
+	reassigned := make(chan int, 4)
+	c1, err := sdk.NewConsumer(tr1,
+		sdk.WithGroup("push-test"),
+		sdk.WithHeartbeatInterval(5*time.Second),
+		sdk.WithAssignListener(func(_ context.Context, parts []proto.PartitionRef) error {
+			select {
+			case reassigned <- len(parts):
+			default:
+			}
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	if err := c1.Subscribe(ctx, "events", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drain the initial-assign signal (4 partitions on a sole member).
+	select {
+	case n := <-reassigned:
+		if n != 4 {
+			t.Fatalf("initial assignment: got %d partitions, want 4", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial assignment never fired")
+	}
+
+	// Act — second consumer joins after a brief delay. With server
+	// push this triggers a rebalance, which c1's long-poll heartbeat
+	// observes near-instantly and rejoins.
+	start := time.Now()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		c2, err := sdk.NewConsumer(tr2,
+			sdk.WithGroup("push-test"),
+			sdk.WithHeartbeatInterval(5*time.Second),
+		)
+		if err != nil {
+			return
+		}
+		_ = c2.Subscribe(ctx, "events", 0)
+		<-ctx.Done()
+		_ = c2.Close()
+	}()
+
+	// Assert — c1 reassigns within 1 second (well under the 5s
+	// heartbeat deadline). On the new generation it should hold half
+	// of the four partitions.
+	select {
+	case n := <-reassigned:
+		elapsed := time.Since(start)
+		if elapsed > 1*time.Second {
+			t.Errorf("rebalance arrived in %v — should be near-instant via server push, not heartbeat-deadline (5s)", elapsed)
+		}
+		if n != 2 {
+			t.Errorf("post-rebalance partitions: got %d, want 2", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rebalance did not propagate to c1 within 2s — server-pushed signal not delivered")
+	}
+}
+
+// TestBootstrap_IncludesActiveSegment proves the recipient observes
+// every record the donor had at snapshot time — including the records
+// still in the donor's currently-open active segment.
+//
+// Without active-segment inclusion (the batch-21 limit), only the
+// sealed-segment prefix would transfer, leaving the recipient with
+// fewer records than the donor. Batch 22's chunked snapshot flow
+// captures the active segment's size under the partition's mu and
+// streams those bytes too, so the recipient sees the donor's full
+// snapshot-time state.
+func TestBootstrap_IncludesActiveSegment(t *testing.T) {
+	// Arrange — donor with disk store, small segment-roll threshold,
+	// and a partial-segment's worth of records appended last so a
+	// non-empty active segment exists at snapshot time. Each record
+	// frames to 63 bytes, segmentSize=256 holds 5 records, so 103
+	// records fill 20 sealed segments and leave 3 in the active
+	// segment — the records the test asserts must transfer.
+	const totalRecords = 103
+	donorDir := t.TempDir()
+	donor, err := embed.NewDisk(donorDir, embed.WithSegmentBytes(256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer donor.Close()
+	if err := donor.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	donorAddr, err := donor.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	prod, err := sdk.NewProducer(donor.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range totalRecords {
+		if _, err := prod.Send(ctx, "events", proto.Record{
+			Key:   []byte{byte(i)},
+			Value: []byte("xxxxxxxxxxxxxxxxxxxxxxxxxx"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = prod.Close()
+
+	// Act — bootstrap recipient from donor over the wire.
+	recipientDir := t.TempDir()
+	tr, err := holocronnet.Dial(donorAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	p := proto.PartitionRef{Topic: "events", Index: 0}
+	if _, err := embed.BootstrapPartitionFromPeer(ctx, tr, recipientDir, p); err != nil {
+		t.Fatalf("BootstrapPartitionFromPeer: %v", err)
+	}
+
+	// Open recipient against the seeded dir.
+	recipient, err := embed.NewDisk(recipientDir, embed.WithSegmentBytes(256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recipient.Close()
+	if err := recipient.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert — every record the donor had is now readable from the
+	// recipient. The full count proves the active segment transferred,
+	// not just the sealed prefix.
+	consumer, err := sdk.NewConsumer(recipient.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Close()
+	if err := consumer.Subscribe(ctx, "events", 0); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]proto.Record, 0, totalRecords)
+	for len(got) < totalRecords {
+		recs, err := consumer.Poll(ctx, totalRecords-len(got))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, recs...)
+	}
+	if len(got) != totalRecords {
+		t.Fatalf("recipient saw %d records, want %d — active segment did not transfer", len(got), totalRecords)
+	}
+	for i, r := range got {
+		if r.Offset != int64(i) {
+			t.Fatalf("record %d: offset=%d, want %d", i, r.Offset, i)
+		}
+	}
+}
+
+// TestBootstrap_PartitionFromPeerOverWire proves a brand-new broker
+// can seed its data dir from an existing peer's sealed segments,
+// then serve those records itself — the foundation of the cluster
+// follower bootstrap.
+func TestBootstrap_PartitionFromPeerOverWire(t *testing.T) {
+	// Arrange — donor on disk with a small segment-roll threshold so
+	// multiple sealed segments accumulate before bootstrap.
+	donorDir := t.TempDir()
+	donor, err := embed.NewDisk(donorDir, embed.WithSegmentBytes(256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer donor.Close()
+	if err := donor.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	donorAddr, err := donor.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	prod, err := sdk.NewProducer(donor.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 100 {
+		if _, err := prod.Send(ctx, "events", proto.Record{
+			Key:   []byte{byte(i)},
+			Value: []byte("xxxxxxxxxxxxxxxxxxxxxxxxxx"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = prod.Close()
+
+	// Act — recipient is a brand-new broker. Before opening its own
+	// FileStore, ask the donor over the wire for its sealed snapshot
+	// and write it under recipientDir.
+	recipientDir := t.TempDir()
+	tr, err := holocronnet.Dial(donorAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	p := proto.PartitionRef{Topic: "events", Index: 0}
+	written, err := embed.BootstrapPartitionFromPeer(ctx, tr, recipientDir, p)
+	if err != nil {
+		t.Fatalf("BootstrapPartitionFromPeer: %v", err)
+	}
+	if written < 4 {
+		// At ~26 bytes/record × 100 records ÷ 256-byte segments we
+		// should have rolled enough times to ship ≥2 sealed segments,
+		// each with both .log and .idx (4 files minimum).
+		t.Fatalf("seeded files: got %d, want >= 4", written)
+	}
+
+	// Open recipient against the seeded dir; pre-create the topic so
+	// the partition validates. The on-disk segments should be picked
+	// up by the FileStore.
+	recipient, err := embed.NewDisk(recipientDir, embed.WithSegmentBytes(256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recipient.Close()
+	if err := recipient.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert — recipient can read records from offset 0. They came
+	// exclusively from the donor's sealed segments, so the recipient
+	// has at least one record without ever receiving a Publish.
+	consumer, err := sdk.NewConsumer(recipient.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Close()
+	if err := consumer.Subscribe(ctx, "events", 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := consumer.Poll(ctx, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 {
+		t.Fatal("recipient saw 0 records — bootstrap did not seed any sealed records into the recipient's data dir")
+	}
+	for i, r := range got {
+		if r.Offset != int64(i) {
+			t.Fatalf("record %d: offset=%d, want %d", i, r.Offset, i)
+		}
 	}
 }

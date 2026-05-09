@@ -18,7 +18,11 @@ import (
 //	GET    /subjects/{subject}/versions       — list versions
 //	GET    /subjects/{subject}/versions/{v}   — fetch (v: number or "latest")
 //	DELETE /subjects/{subject}                — soft-delete via tombstone
+//	DELETE /subjects/{subject}/versions/{v}   — soft-delete one version
 //	GET    /schemas/ids/{id}                  — fetch by global ID
+//	DELETE /schemas/ids/{id}                  — soft-delete by global ID
+//	GET    /config/{subject}                  — read per-subject compatibility mode
+//	PUT    /config/{subject}                  — set per-subject compatibility mode
 //	POST   /compatibility/subjects/{subject}/versions/latest — check compat
 //
 // Errors are returned as JSON with `error_code` and `message` fields, also
@@ -81,11 +85,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.register(w, r, parts[1])
 	case len(parts) == 4 && parts[0] == "subjects" && parts[2] == "versions" && r.Method == http.MethodGet:
 		h.getVersion(w, r, parts[1], parts[3])
+	case len(parts) == 4 && parts[0] == "subjects" && parts[2] == "versions" && r.Method == http.MethodDelete:
+		h.deleteVersion(w, r, parts[1], parts[3])
+	case len(parts) == 5 && parts[0] == "subjects" && parts[2] == "versions" && parts[4] == "schema" && r.Method == http.MethodGet:
+		h.getVersionSchemaText(w, r, parts[1], parts[3])
 	case len(parts) == 3 && parts[0] == "schemas" && parts[1] == "ids" && r.Method == http.MethodGet:
 		h.getByID(w, r, parts[2])
+	case len(parts) == 4 && parts[0] == "schemas" && parts[1] == "ids" && parts[3] == "schema" && r.Method == http.MethodGet:
+		h.getByIDSchemaText(w, r, parts[2])
+	case len(parts) == 3 && parts[0] == "schemas" && parts[1] == "ids" && r.Method == http.MethodDelete:
+		h.deleteByID(w, r, parts[2])
 	case len(parts) == 5 && parts[0] == "compatibility" && parts[1] == "subjects" &&
 		parts[3] == "versions" && parts[4] == "latest" && r.Method == http.MethodPost:
 		h.checkCompatibility(w, r, parts[2])
+	case len(parts) == 2 && parts[0] == "config" && r.Method == http.MethodGet:
+		h.getConfig(w, r, parts[1])
+	case len(parts) == 2 && parts[0] == "config" && r.Method == http.MethodPut:
+		h.putConfig(w, r, parts[1])
 	default:
 		writeError(w, http.StatusNotFound, 40401, fmt.Sprintf("unknown path %s %s", r.Method, r.URL.Path))
 	}
@@ -113,6 +129,109 @@ func (h *Handler) deleteSubject(w http.ResponseWriter, r *http.Request, subject 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": subject})
+}
+
+// getVersionSchemaText implements GET
+// /subjects/{subject}/versions/{v}/schema. Returns just the
+// schema text (Confluent Schema Registry's bare-text variant of
+// the wrapped /versions/{v} endpoint). Useful for clients that
+// want to feed the schema directly to a parser without unwrapping
+// the JSON envelope.
+func (h *Handler) getVersionSchemaText(w http.ResponseWriter, _ *http.Request, subject, versionStr string) {
+	sc, err := resolveVersion(h.svc, subject, versionStr)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(sc.Schema))
+}
+
+// getByIDSchemaText implements GET /schemas/ids/{id}/schema —
+// the bare-text counterpart of /schemas/ids/{id}. Same Confluent
+// compat motivation as getVersionSchemaText.
+func (h *Handler) getByIDSchemaText(w http.ResponseWriter, _ *http.Request, idStr string) {
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id < 0 {
+		writeError(w, http.StatusBadRequest, 40001, "invalid id: must be a non-negative integer")
+		return
+	}
+	sc, err := h.svc.GetByID(id)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(sc.Schema))
+}
+
+// getConfig implements GET /config/{subject}. Returns the
+// configured compatibility mode in the Confluent shape:
+// {"compatibilityLevel": "BACKWARD"}. Subjects without a
+// configured mode return "NONE".
+func (h *Handler) getConfig(w http.ResponseWriter, _ *http.Request, subject string) {
+	mode := h.svc.GetCompatibility(subject)
+	if mode == "" {
+		mode = CompatibilityNone
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"compatibilityLevel": string(mode)})
+}
+
+// putConfig implements PUT /config/{subject} with body
+// {"compatibility": "BACKWARD"} (or "compatibilityLevel" — both
+// accepted for Confluent compatibility). Persists the mode so a
+// subsequent Register on the subject runs the matching
+// compatibility check automatically.
+func (h *Handler) putConfig(w http.ResponseWriter, r *http.Request, subject string) {
+	var body struct {
+		Compatibility      Compatibility `json:"compatibility"`
+		CompatibilityLevel Compatibility `json:"compatibilityLevel"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, 42208, "invalid request body")
+		return
+	}
+	mode := body.Compatibility
+	if mode == "" {
+		mode = body.CompatibilityLevel
+	}
+	if err := h.svc.SetCompatibility(r.Context(), subject, mode); err != nil {
+		writeError(w, http.StatusBadRequest, 42203, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"compatibility": string(mode)})
+}
+
+// deleteByID implements DELETE /schemas/ids/{id}. Resolves the ID
+// to a (subject, version) and removes that version via a
+// per-version tombstone; sibling versions of the subject and
+// every other subject remain intact.
+func (h *Handler) deleteByID(w http.ResponseWriter, r *http.Request, idStr string) {
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id < 0 {
+		writeError(w, http.StatusBadRequest, 40001, "invalid id: must be a non-negative integer")
+		return
+	}
+	if err := h.svc.DeleteByID(r.Context(), id); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted_id": id})
+}
+
+// deleteVersion implements DELETE /subjects/{subject}/versions/{v}.
+// Removes only the named version of subject; other versions remain.
+func (h *Handler) deleteVersion(w http.ResponseWriter, r *http.Request, subject, version string) {
+	v, err := strconv.Atoi(version)
+	if err != nil || v <= 0 {
+		writeError(w, http.StatusBadRequest, 40001, "invalid version: must be a positive integer")
+		return
+	}
+	if err := h.svc.DeleteVersion(r.Context(), subject, v); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": subject, "version": v})
 }
 
 func (h *Handler) listSubjects(w http.ResponseWriter, _ *http.Request) {
@@ -149,23 +268,33 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request, subject strin
 }
 
 func (h *Handler) getVersion(w http.ResponseWriter, _ *http.Request, subject, versionStr string) {
-	var sc Schema
-	var err error
-	if versionStr == "latest" {
-		sc, err = h.svc.GetLatest(subject)
-	} else {
-		v, perr := strconv.Atoi(versionStr)
-		if perr != nil {
+	sc, err := resolveVersion(h.svc, subject, versionStr)
+	if err != nil {
+		if errors.Is(err, errBadVersionString) {
 			writeError(w, http.StatusBadRequest, 42202, fmt.Sprintf("invalid version %q", versionStr))
 			return
 		}
-		sc, err = h.svc.GetVersion(subject, v)
-	}
-	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, sc)
+}
+
+// resolveVersion handles the "latest" alias and the numeric form
+// in one place. Sentinel errBadVersionString lets callers map
+// parse failures to a 400 instead of the 404 GetVersion would
+// otherwise produce.
+var errBadVersionString = errors.New("invalid version string")
+
+func resolveVersion(svc *Service, subject, versionStr string) (Schema, error) {
+	if versionStr == "latest" {
+		return svc.GetLatest(subject)
+	}
+	v, err := strconv.Atoi(versionStr)
+	if err != nil {
+		return Schema{}, errBadVersionString
+	}
+	return svc.GetVersion(subject, v)
 }
 
 func (h *Handler) getByID(w http.ResponseWriter, _ *http.Request, idStr string) {

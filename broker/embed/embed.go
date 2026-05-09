@@ -31,6 +31,11 @@ import (
 // need to import broker/internal/topic.
 type TopicSpec = topic.Spec
 
+// dedupTopic is the single-partition internal topic where the
+// disk broker persists producer-idempotency checkpoints so dedup
+// state survives a restart.
+const dedupTopic = "__holocron_dedup"
+
 // topicsFileName is the JSON file inside the data dir that persists topic
 // metadata across restarts.
 const topicsFileName = "topics.json"
@@ -189,8 +194,22 @@ func NewDisk(dir string, opts ...DiskOption) (*Broker, error) {
 	}
 	gm := groups.NewManager(offsetsStore, registry.PartitionsFor)
 
+	// Persist producer-idempotency dedup checkpoints to a single-
+	// partition `__holocron_dedup` topic so retries that span a
+	// broker restart still dedup. Each broker.Publish that carries
+	// producer headers writes a record here; on startup (below)
+	// we replay the topic into the broker's in-memory dedup table.
+	if err := registry.Create(topic.Spec{Name: dedupTopic, PartitionCount: 1}); err != nil &&
+		!errors.Is(err, topic.ErrTopicExists) {
+		return nil, fmt.Errorf("dedup topic: %w", err)
+	}
+
 	m := metrics.New()
-	brokerOpts := []broker.Option{broker.WithGroupManager(gm), broker.WithMetrics(m)}
+	brokerOpts := []broker.Option{
+		broker.WithGroupManager(gm),
+		broker.WithMetrics(m),
+		broker.WithDedupTopic(dedupTopic),
+	}
 	var cl *cluster.Cluster
 	if cfg.cluster != nil {
 		fsm := cluster.NewFSM(store, registry)
@@ -213,6 +232,9 @@ func NewDisk(dir string, opts ...DiskOption) (*Broker, error) {
 	}
 
 	core := broker.New(store, registry, brokerOpts...)
+	if err := hydrateDedupFromTopic(store, core); err != nil {
+		return nil, fmt.Errorf("hydrate dedup: %w", err)
+	}
 	b := &Broker{
 		store:     store,
 		registry:  registry,
@@ -235,6 +257,23 @@ func NewDisk(dir string, opts ...DiskOption) (*Broker, error) {
 func (b *Broker) Transport() sdk.Transport { return b.transport }
 
 // CreateTopic registers a topic with the given spec.
+// DeleteTopic removes the named topic and every record on it.
+// Replicated through Raft on a clustered broker; on a single broker
+// the registry and storage are updated directly. Returns
+// topic.ErrTopicNotFound for an unknown name; the SDK error type
+// surfaces ErrNotLeader on followers in cluster mode.
+func (b *Broker) DeleteTopic(name string) error {
+	return b.core.DeleteTopic(name)
+}
+
+// UpdateTopicConfig changes the named topic's retention and
+// segment-size settings. retentionMs and segmentBytes <= 0 are
+// "no change" so callers can adjust one knob without disturbing
+// the other. Partition count is immutable.
+func (b *Broker) UpdateTopicConfig(name string, retentionMs, segmentBytes int64) error {
+	return b.core.UpdateTopicConfig(name, retentionMs, segmentBytes)
+}
+
 func (b *Broker) CreateTopic(spec TopicSpec) error {
 	return b.registry.Create(spec)
 }
@@ -316,7 +355,15 @@ type listenOpts struct {
 	tlsConfig *tls.Config
 	apiKeys   []string
 	quotas    map[string]server.Quota
+	acls      map[string]server.ACL
 }
+
+// ACL is re-exported from the internal server package so callers can
+// build per-key authorization tables without importing internal/.
+// Produce and Consume each list the topics the API key may publish
+// to or read from. A list containing the wildcard "*" grants the
+// permission on every topic; an empty list denies all.
+type ACL = server.ACL
 
 // WithTLS wraps the broker's wire-protocol listener in TLS using the
 // supplied config. Producer + consumer SDK callers must dial with
@@ -348,6 +395,19 @@ func WithQuotas(quotas map[string]Quota) ListenOption {
 	return func(o *listenOpts) { o.quotas = quotas }
 }
 
+// WithACL declares per-API-key authorization. Each entry lists the
+// topics the key may produce to and consume from. Without an
+// associated ACL the key is denied on every topic-bound operation;
+// keys not configured at all (the WithAPIKeys deny-all path) are
+// rejected at handshake before authorization runs.
+//
+// Authentication answers "who is calling"; authorization answers
+// "what they may do." Layer them deliberately: WithAPIKeys is the
+// gate; WithACL is the lock pattern behind it.
+func WithACL(acls map[string]ACL) ListenOption {
+	return func(o *listenOpts) { o.acls = acls }
+}
+
 // Listen starts a network listener on addr (":9092", ":0", etc.) so
 // remote producers and consumers can connect. The listener runs until
 // the Broker is Closed. Returns the bound address — useful when addr
@@ -373,6 +433,9 @@ func (b *Broker) Listen(addr string, opts ...ListenOption) (string, error) {
 	}
 	if len(cfg.quotas) > 0 {
 		srv.SetQuotas(cfg.quotas)
+	}
+	if len(cfg.acls) > 0 {
+		srv.SetACL(cfg.acls)
 	}
 	b.srv = srv
 	b.mu.Unlock()

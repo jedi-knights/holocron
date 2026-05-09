@@ -34,7 +34,7 @@ type Topology struct {
 	pipes        []pipeline
 	joins        []joinPipeline
 	tables       []*KTable // materialized views; one consumer goroutine per table
-	stores       map[string]StateStore
+	stores       map[string]*PartitionedStore
 	foreachSeq   int
 	watermark    int64 // max event-time observed across all pipelines
 	lastRecordAt int64 // wall-clock unix ns of most recent record receipt
@@ -146,10 +146,12 @@ type pipeline struct {
 	punctuators []PunctuatorFunc
 }
 
-// op is the kernel of every operator: take a record, possibly use a
-// state store, return zero or more output records. Stateful operators
-// reference their store by name through topology.stores.
-type op func(rec proto.Record, t *Topology) []proto.Record
+// op is the kernel of every operator: take a record, the partition the
+// record originated from, and optionally consult the topology — return
+// zero or more output records. Stateful operators use partition to
+// scope their state-store accesses to a partition-specific substore,
+// which keeps tasks operating on disjoint partitions race-free.
+type op func(rec proto.Record, t *Topology, partition int) []proto.Record
 
 // New constructs a Topology bound to a Transport.
 func New(transport sdk.Transport, opts ...Option) (*Topology, error) {
@@ -159,7 +161,7 @@ func New(transport sdk.Transport, opts ...Option) (*Topology, error) {
 	t := &Topology{
 		transport: transport,
 		maxTasks:  1,
-		stores:    make(map[string]StateStore),
+		stores:    make(map[string]*PartitionedStore),
 	}
 	for _, opt := range opts {
 		opt(t)
@@ -168,13 +170,20 @@ func New(transport sdk.Transport, opts ...Option) (*Topology, error) {
 }
 
 // Store returns the named state store, creating one on first access.
-// The default backing is in-memory; WithChangelogStores switches the
-// factory to ChangelogStore (replays from <name>-changelog on creation,
-// writes through to the topic on Put).
+// Returned stores are partition-scoped: operators read and write to a
+// per-partition substore via Store(name).For(partition); external
+// inspectors call Store(name).Get / Range to view aggregated state
+// across every partition.
+//
+// The default factory is in-memory — each partition gets its own
+// MemoryStore. WithChangelogStores switches to a single shared
+// ChangelogStore: every partition lookup returns the same instance,
+// preserving pre-batch-21 changelog semantics until per-partition
+// changelog topics arrive in a future stage.
 //
 // A factory failure (e.g. changelog topic missing) falls back to
-// in-memory and records the error for Stop to surface.
-func (t *Topology) Store(name string) StateStore {
+// per-partition in-memory and records the error for Stop to surface.
+func (t *Topology) Store(name string) *PartitionedStore {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if s, ok := t.stores[name]; ok {
@@ -185,16 +194,38 @@ func (t *Topology) Store(name string) StateStore {
 	return s
 }
 
-func (t *Topology) openStoreLocked(name string) StateStore {
+// openStoreLocked builds the PartitionedStore wrapper for name. Caller
+// holds t.mu.
+//
+// In changelog mode the factory opens a fresh per-partition
+// ChangelogStore on demand: each partition's state lives in its own
+// partition of the <name>-changelog topic, so a rebalance that
+// hands partition N to a different member rebuilds N's state from
+// N's changelog without leaking other partitions' history.
+//
+// Every partition of the changelog topic is opened eagerly so a
+// subsequent aggregated Get/Range on the PartitionedStore — common
+// in tests and external inspection — reflects the replayed state
+// without first having to drive a record through each partition.
+func (t *Topology) openStoreLocked(name string) *PartitionedStore {
 	if !t.useChangelog {
-		return NewMemoryStore()
+		return NewPartitionedStore(NewMemoryStoreFactory())
 	}
-	cs, err := OpenChangelogStore(context.Background(), t.transport, name)
-	if err != nil {
-		t.recordErr(fmt.Errorf("streams: changelog store %q (falling back to memory): %w", name, err))
-		return NewMemoryStore()
+	transport := t.transport
+	ps := NewPartitionedStore(func(partition int) StateStore {
+		cs, err := OpenChangelogStorePartition(context.Background(), transport, name, partition)
+		if err != nil {
+			t.recordErr(fmt.Errorf("streams: changelog store %q partition %d (falling back to memory): %w", name, partition, err))
+			return NewMemoryStore()
+		}
+		return cs
+	})
+	if n, err := transport.PartitionsFor(context.Background(), name+"-changelog"); err == nil {
+		for i := range int(n) {
+			ps.For(i)
+		}
 	}
-	return cs
+	return ps
 }
 
 // Stream begins a new pipeline reading from sourceTopic.
@@ -231,7 +262,7 @@ func (s *Stream) withPunctuator(fn PunctuatorFunc) *Stream {
 
 // Filter drops records where pred returns false.
 func (s *Stream) Filter(pred func(proto.Record) bool) *Stream {
-	return s.appendOp(func(r proto.Record, _ *Topology) []proto.Record {
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
 		if pred(r) {
 			return []proto.Record{r}
 		}
@@ -239,19 +270,131 @@ func (s *Stream) Filter(pred func(proto.Record) bool) *Stream {
 	})
 }
 
+// FilterNot drops records where pred returns true. Sugar for
+// `Filter(func(r) bool { return !pred(r) })` — reads more clearly
+// when the natural predicate is the negation ("drop tombstones",
+// "drop heartbeat records", etc.).
+func (s *Stream) FilterNot(pred func(proto.Record) bool) *Stream {
+	return s.Filter(func(r proto.Record) bool { return !pred(r) })
+}
+
 // Map transforms each record into a new record. Drop a record by
 // returning a zero-value Record from a Filter step rather than from Map.
 func (s *Stream) Map(fn func(proto.Record) proto.Record) *Stream {
-	return s.appendOp(func(r proto.Record, _ *Topology) []proto.Record {
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
 		return []proto.Record{fn(r)}
 	})
 }
 
 // FlatMap transforms each record into zero or more records.
 func (s *Stream) FlatMap(fn func(proto.Record) []proto.Record) *Stream {
-	return s.appendOp(func(r proto.Record, _ *Topology) []proto.Record {
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
 		return fn(r)
 	})
+}
+
+// SelectKey replaces each record's key with fn(record). Value and
+// headers are preserved. Useful before a join or
+// GroupByKey-driven aggregation when the join/group key is
+// derived from the value rather than the original key.
+//
+// Caveat: re-keying does NOT repartition. With a multi-partition
+// source topic, two records with the new same key may live on
+// different partitions; downstream `GroupByKey` aggregations stay
+// per-partition (the per-partition state stores from batch 21).
+// Pair with `Through` to a single-partition intermediate topic if
+// you need cross-partition grouping after re-key.
+func (s *Stream) SelectKey(fn func(proto.Record) []byte) *Stream {
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
+		next := r
+		next.Key = fn(r)
+		return []proto.Record{next}
+	})
+}
+
+// MapValues transforms each record's value via fn while preserving
+// key and headers. Lighter-weight than Map for the common case of
+// "decode/transform/re-encode the payload" — saves the user from
+// manually copying key/headers through.
+func (s *Stream) MapValues(fn func([]byte) []byte) *Stream {
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
+		next := r
+		next.Value = fn(r.Value)
+		return []proto.Record{next}
+	})
+}
+
+// MapKeyValue transforms key and value together, returning a new
+// (key, value) pair while preserving headers. Reads more clearly
+// than Map when the transformation only touches those two fields
+// and avoids having to construct a fresh Record literal.
+func (s *Stream) MapKeyValue(fn func(key, value []byte) (newKey, newValue []byte)) *Stream {
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
+		k, v := fn(r.Key, r.Value)
+		next := r
+		next.Key = k
+		next.Value = v
+		return []proto.Record{next}
+	})
+}
+
+// Peek calls fn on each record without modifying the stream. Used
+// for side effects: logging, tracing, metrics. Returns the
+// original record unchanged so .Peek can be inserted anywhere in
+// a chain without disturbing downstream operators.
+//
+// fn must not retain references to r — the runtime reuses
+// Record instances. Copy fields if you need to outlive the call.
+func (s *Stream) Peek(fn func(proto.Record)) *Stream {
+	return s.appendOp(func(r proto.Record, _ *Topology, _ int) []proto.Record {
+		fn(r)
+		return []proto.Record{r}
+	})
+}
+
+// Branch splits a stream into N parallel streams, each carrying
+// only the records that match its predicate. Predicates are
+// evaluated in order; a record routes to the FIRST branch whose
+// predicate returns true. Records that match none are dropped.
+//
+// Each returned Stream is an independent pipeline — finalize each
+// with .To(topic) to write its slice of the source. Because each
+// branch becomes its own consumer-group pipeline reading the same
+// source topic, total read bandwidth scales linearly with the
+// branch count; a single-consumer fan-out is a future optimization.
+func (s *Stream) Branch(preds ...func(proto.Record) bool) []*Stream {
+	out := make([]*Stream, len(preds))
+	for i := range preds {
+		// Capture earlier predicates so this branch only sees
+		// records they didn't claim. Captures are read-only after
+		// Branch returns — predicates can't be added later.
+		priors := append([]func(proto.Record) bool(nil), preds[:i]...)
+		mine := preds[i]
+		out[i] = s.Filter(func(r proto.Record) bool {
+			for _, p := range priors {
+				if p(r) {
+					return false
+				}
+			}
+			return mine(r)
+		})
+	}
+	return out
+}
+
+// Through routes records through an intermediate broker topic and
+// resumes the chain on the other side. Equivalent to
+// `s.To(topic); topology.Stream(topic)` — the upstream chain
+// terminates by writing to topic; the returned Stream is a fresh
+// pipeline reading from topic with no upstream ops attached.
+//
+// Lets a topology persist intermediate state for durability or
+// repartitioning without manually splitting into two topologies.
+// The intermediate topic must already exist; Through does not
+// create it (mirrors Stream and To).
+func (s *Stream) Through(topic string) *Stream {
+	s.To(topic)
+	return s.topology.Stream(topic)
 }
 
 // To registers the pipeline with the topology, writing each output
@@ -296,21 +439,39 @@ func (s *Stream) GroupByKey() *GroupedStream {
 	return &GroupedStream{stream: s}
 }
 
+// GroupBy derives the grouping key from each record via fn and
+// returns a GroupedStream ready for Count / Aggregate / Reduce /
+// windowed counts. Sugar over SelectKey followed by GroupByKey —
+// reads more clearly at call sites where the grouping isn't the
+// record's original key.
+//
+// Same partitioning caveat as SelectKey: re-keying does NOT
+// repartition the source topic, so two records with the new same
+// key may land on different partitions. Aggregations stay
+// per-partition (per the batch-21 partitioned-state-store model).
+// Pair with `Through` to a single-partition intermediate topic if
+// cross-partition grouping is required.
+func (s *Stream) GroupBy(fn func(proto.Record) []byte) *GroupedStream {
+	return &GroupedStream{stream: s.SelectKey(fn)}
+}
+
 // GroupedStream is a Stream marked for keyed aggregation.
 type GroupedStream struct {
 	stream *Stream
 }
 
 // Count emits an updated count for each input record, keyed the same.
-// State lives in the named store; the output record's value is the
-// big-endian uint64 encoding of the new count.
+// State lives in the named store, scoped to the source partition; the
+// output record's value is the big-endian uint64 encoding of the new
+// count.
 func (g *GroupedStream) Count(storeName string) *Stream {
 	store := g.stream.topology.Store(storeName)
-	return g.stream.appendOp(func(r proto.Record, _ *Topology) []proto.Record {
-		current, _ := store.Get(r.Key)
+	return g.stream.appendOp(func(r proto.Record, _ *Topology, partition int) []proto.Record {
+		sub := store.For(partition)
+		current, _ := sub.Get(r.Key)
 		next := DecodeCount(current) + 1
 		encoded := EncodeCount(next)
-		store.Put(r.Key, encoded)
+		sub.Put(r.Key, encoded)
 		return []proto.Record{{
 			Key:     append([]byte(nil), r.Key...),
 			Value:   encoded,
@@ -319,16 +480,46 @@ func (g *GroupedStream) Count(storeName string) *Stream {
 	})
 }
 
+// Reduce combines the values for each key via a user-supplied
+// associative function. The first record establishes the
+// accumulator; each subsequent record's value is folded into the
+// accumulator via fn(accum, recordValue). State is scoped to the
+// source partition.
+//
+// Sugar over Aggregate with the conventional reduce shape (input
+// and output share a value space) — callers that need a separate
+// accumulator type should use Aggregate directly.
+func (g *GroupedStream) Reduce(storeName string, fn func(accum, value []byte) []byte) *Stream {
+	store := g.stream.topology.Store(storeName)
+	return g.stream.appendOp(func(r proto.Record, _ *Topology, partition int) []proto.Record {
+		sub := store.For(partition)
+		prev, ok := sub.Get(r.Key)
+		var next []byte
+		if ok {
+			next = fn(prev, r.Value)
+		} else {
+			next = append([]byte(nil), r.Value...)
+		}
+		sub.Put(r.Key, next)
+		return []proto.Record{{
+			Key:     append([]byte(nil), r.Key...),
+			Value:   append([]byte(nil), next...),
+			Headers: r.Headers,
+		}}
+	})
+}
+
 // Aggregate emits an updated value per key by combining the previous
 // aggregate with the new record. The aggregator receives the existing
 // value (nil if first time), the incoming record, and returns the new
-// aggregate.
+// aggregate. State is scoped to the source partition.
 func (g *GroupedStream) Aggregate(storeName string, agg func(prev []byte, r proto.Record) []byte) *Stream {
 	store := g.stream.topology.Store(storeName)
-	return g.stream.appendOp(func(r proto.Record, _ *Topology) []proto.Record {
-		prev, _ := store.Get(r.Key)
+	return g.stream.appendOp(func(r proto.Record, _ *Topology, partition int) []proto.Record {
+		sub := store.For(partition)
+		prev, _ := sub.Get(r.Key)
 		next := agg(prev, r)
-		store.Put(r.Key, next)
+		sub.Put(r.Key, next)
 		return []proto.Record{{
 			Key:     append([]byte(nil), r.Key...),
 			Value:   append([]byte(nil), next...),
@@ -410,7 +601,7 @@ func (t *Topology) run(ctx context.Context, p pipeline, producer *sdk.Producer) 
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		records, err := consumer.Poll(ctx, 256)
+		records, err := consumer.PollMeta(ctx, 256)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
@@ -421,13 +612,14 @@ func (t *Topology) run(ctx context.Context, p pipeline, producer *sdk.Producer) 
 		if len(records) > 0 {
 			atomic.StoreInt64(&t.lastRecordAt, time.Now().UnixNano())
 		}
-		for _, r := range records {
-			t.advanceWatermark(t.eventTime(r))
-			out := []proto.Record{r}
+		for _, pr := range records {
+			t.advanceWatermark(t.eventTime(pr.Record))
+			partition := int(pr.Partition.Index)
+			out := []proto.Record{pr.Record}
 			for _, o := range p.ops {
 				next := out[:0]
 				for _, in := range out {
-					next = append(next, o(in, t)...)
+					next = append(next, o(in, t, partition)...)
 				}
 				out = next
 				if len(out) == 0 {

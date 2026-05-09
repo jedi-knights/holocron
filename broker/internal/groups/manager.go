@@ -1,6 +1,7 @@
 package groups
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -83,6 +84,13 @@ type group struct {
 	assignments map[string][]proto.PartitionRef
 	generation  int32
 	dirty       bool // assignments out of date — recompute on next access
+
+	// watchers receive a synchronous wake-up when this group's
+	// generation changes. Each entry corresponds to one outstanding
+	// long-poll heartbeat (HeartbeatWait). The slice is rebuilt on
+	// every notify; entries whose context cancelled or who timed out
+	// remove themselves on exit.
+	watchers []chan struct{}
 }
 
 type member struct {
@@ -198,6 +206,10 @@ func (m *Manager) Join(groupName, memberID string, topics []string) (JoinResult,
 func (m *Manager) Heartbeat(groupName, memberID string, generation int32) (HeartbeatResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.heartbeatLocked(groupName, memberID, generation)
+}
+
+func (m *Manager) heartbeatLocked(groupName, memberID string, generation int32) (HeartbeatResult, error) {
 	g, ok := m.groups[groupName]
 	if !ok {
 		return HeartbeatResult{RebalanceNeeded: true}, ErrUnknownMember
@@ -220,7 +232,90 @@ func (m *Manager) Heartbeat(groupName, memberID string, generation int32) (Heart
 	return HeartbeatResult{}, nil
 }
 
+// HeartbeatWait is a long-poll variant of Heartbeat. It records the
+// member as alive and then blocks for up to maxWait, returning
+// immediately when:
+//
+//   - the member needs to rebalance (generation stale or peers
+//     evicted) — RebalanceNeeded=true;
+//   - a peer joins or leaves the group while the wait is active,
+//     forcing a rebalance — RebalanceNeeded=true;
+//   - maxWait elapses without a signal — RebalanceNeeded=false;
+//   - ctx is cancelled — returns ctx.Err().
+//
+// maxWait ≤ 0 short-circuits to ordinary Heartbeat behavior. The
+// "server-pushed" rebalance signal is delivered through this method:
+// rather than the SDK polling Heartbeat every N ms, the SDK opens a
+// single long-poll call that the broker resolves the moment a
+// rebalance is needed, cutting the duplicate-production window
+// during rebalance to roughly the round-trip time.
+func (m *Manager) HeartbeatWait(ctx context.Context, groupName, memberID string, generation int32, maxWait time.Duration) (HeartbeatResult, error) {
+	m.mu.Lock()
+	res, err := m.heartbeatLocked(groupName, memberID, generation)
+	if err != nil || res.RebalanceNeeded || maxWait <= 0 {
+		m.mu.Unlock()
+		return res, err
+	}
+
+	// Register a watcher under the lock so any rebalance scheduled
+	// after this point will signal us. The watcher is buffered (cap 1)
+	// so a notifier never blocks waiting for us to receive.
+	g := m.groups[groupName]
+	wake := make(chan struct{}, 1)
+	g.watchers = append(g.watchers, wake)
+	m.mu.Unlock()
+
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	select {
+	case <-wake:
+		return HeartbeatResult{RebalanceNeeded: true}, nil
+	case <-timer.C:
+		m.removeWatcher(groupName, wake)
+		return HeartbeatResult{}, nil
+	case <-ctx.Done():
+		m.removeWatcher(groupName, wake)
+		return HeartbeatResult{}, ctx.Err()
+	}
+}
+
+// removeWatcher drops wake from the named group's watcher list.
+// Called by HeartbeatWait paths that exit without being signalled
+// (timer fired, ctx cancelled) so abandoned wake channels don't
+// accumulate. Safe to call after the group has been deleted.
+func (m *Manager) removeWatcher(groupName string, wake chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.groups[groupName]
+	if !ok {
+		return
+	}
+	for i, w := range g.watchers {
+		if w == wake {
+			g.watchers = append(g.watchers[:i], g.watchers[i+1:]...)
+			return
+		}
+	}
+}
+
+// notifyWatchersLocked delivers a wake to every registered watcher
+// for g and clears the slice. Caller holds m.mu. The non-blocking
+// send is safe because every watcher channel is cap 1: the receiver
+// either picks up the signal or its select gets cancelled, and the
+// channel garbage-collects when both ends drop.
+func (m *Manager) notifyWatchersLocked(g *group) {
+	for _, w := range g.watchers {
+		select {
+		case w <- struct{}{}:
+		default:
+		}
+	}
+	g.watchers = nil
+}
+
 // Leave removes memberID from the group and triggers a rebalance.
+// Outstanding HeartbeatWait watchers fire immediately so existing
+// peers learn to rejoin without waiting for their next heartbeat.
 func (m *Manager) Leave(groupName, memberID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -235,10 +330,89 @@ func (m *Manager) Leave(groupName, memberID string) error {
 	delete(g.assignments, memberID)
 	g.dirty = true
 	if len(g.members) == 0 {
+		m.notifyWatchersLocked(g)
 		delete(m.groups, groupName)
 		return nil
 	}
+	m.notifyWatchersLocked(g)
 	return nil
+}
+
+// GroupSummary is the operator-facing view of a single group:
+// its name, current generation, and member count. Cheap enough to
+// compute for every known group in one call.
+type GroupSummary struct {
+	Name        string
+	Generation  int32
+	MemberCount int32
+	Topics      []string
+}
+
+// MemberAssignment lists one member's currently-owned partitions
+// inside a group. Returned by Describe.
+type MemberAssignment struct {
+	MemberID   string
+	Partitions []proto.PartitionRef
+}
+
+// GroupDetails is the operator-facing detail view: every member
+// and what each currently owns.
+type GroupDetails struct {
+	Name       string
+	Generation int32
+	Topics     []string
+	Members    []MemberAssignment
+}
+
+// ErrUnknownGroup is returned by Describe when no group by the
+// given name is registered with the manager.
+var ErrUnknownGroup = errors.New("groups: unknown group")
+
+// List returns a summary of every group the manager knows about.
+// Order is unspecified.
+func (m *Manager) List() []GroupSummary {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]GroupSummary, 0, len(m.groups))
+	for _, g := range m.groups {
+		topics := append([]string(nil), g.topics...)
+		out = append(out, GroupSummary{
+			Name:        g.name,
+			Generation:  g.generation,
+			MemberCount: int32(len(g.members)),
+			Topics:      topics,
+		})
+	}
+	return out
+}
+
+// Describe returns the per-member assignment for groupName. Members
+// appear in lexical order so output is deterministic.
+func (m *Manager) Describe(groupName string) (GroupDetails, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.groups[groupName]
+	if !ok {
+		return GroupDetails{}, ErrUnknownGroup
+	}
+	memberIDs := make([]string, 0, len(g.members))
+	for id := range g.members {
+		memberIDs = append(memberIDs, id)
+	}
+	sort.Strings(memberIDs)
+	members := make([]MemberAssignment, 0, len(memberIDs))
+	for _, id := range memberIDs {
+		members = append(members, MemberAssignment{
+			MemberID:   id,
+			Partitions: append([]proto.PartitionRef(nil), g.assignments[id]...),
+		})
+	}
+	return GroupDetails{
+		Name:       g.name,
+		Generation: g.generation,
+		Topics:     append([]string(nil), g.topics...),
+		Members:    members,
+	}, nil
 }
 
 // Commit records a committed offset for (group, partition).
@@ -252,8 +426,11 @@ func (m *Manager) Committed(groupName, topic string, partition int32) (int64, er
 	return m.offsets.Lookup(groupName, topic, partition)
 }
 
-// evictStaleLocked drops members whose last heartbeat is older than the
-// session timeout. Caller must hold m.mu. Returns the number of evictions.
+// evictStaleLocked drops members whose last heartbeat is older than
+// the session timeout. Caller must hold m.mu. Returns the number of
+// evictions. Any eviction marks the group dirty AND wakes
+// outstanding watchers so a long-poll heartbeat held by a survivor
+// sees the rebalance signal without waiting for its own deadline.
 func (m *Manager) evictStaleLocked(g *group) int {
 	cutoff := m.now().Add(-m.sessionTimeout)
 	evicted := 0
@@ -266,12 +443,16 @@ func (m *Manager) evictStaleLocked(g *group) int {
 	}
 	if evicted > 0 {
 		g.dirty = true
+		m.notifyWatchersLocked(g)
 	}
 	return evicted
 }
 
 // rebalanceLocked recomputes assignments and bumps the generation.
-// Caller must hold m.mu.
+// Caller must hold m.mu. After updating the generation, every
+// outstanding HeartbeatWait watcher for g is signalled so existing
+// members learn of the rebalance immediately rather than waiting for
+// their next heartbeat tick.
 func (m *Manager) rebalanceLocked(g *group) error {
 	memberIDs := make([]string, 0, len(g.members))
 	for id := range g.members {
@@ -295,6 +476,7 @@ func (m *Manager) rebalanceLocked(g *group) error {
 	g.assignments = assignments
 	g.generation++
 	g.dirty = false
+	m.notifyWatchersLocked(g)
 	return nil
 }
 

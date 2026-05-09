@@ -86,6 +86,109 @@ func (p *PartitionLog) HighWater() int64 {
 	return p.segments[len(p.segments)-1].highWater
 }
 
+// SegmentSnapshot describes one segment's state at a moment in
+// time: its base offset and the current sizes of the .log and .idx
+// files. Snapshots are taken under the partition's mutex so a
+// downstream reader can fetch byte ranges up to the listed sizes
+// and observe a self-consistent prefix of every segment — including
+// the currently active segment that may be growing concurrently.
+type SegmentSnapshot struct {
+	Base    int64
+	LogSize int64
+	IdxSize int64
+}
+
+// Snapshot returns SegmentSnapshot for every segment in the
+// partition, ordered by ascending base offset. The last entry
+// describes the currently active segment.
+//
+// Before reporting sizes, every segment is flushed and its
+// in-memory index is persisted so the on-disk file matches the
+// reported size. A follower can then read each segment's bytes up
+// to the listed sizes and observe a self-consistent prefix —
+// including bytes from a still-active segment whose buffer would
+// otherwise sit in memory.
+//
+// Returns an error if the flush or persist fails. The partition's
+// mutex is held write-locked across the flush so concurrent
+// appenders can't extend the file mid-snapshot.
+func (p *PartitionLog) Snapshot() ([]SegmentSnapshot, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, seg := range p.segments {
+		if err := seg.snapshotSync(); err != nil {
+			return nil, fmt.Errorf("log: snapshot sync segment %d: %w", seg.baseOffset, err)
+		}
+	}
+	out := make([]SegmentSnapshot, 0, len(p.segments))
+	for _, seg := range p.segments {
+		out = append(out, SegmentSnapshot{
+			Base:    seg.baseOffset,
+			LogSize: seg.size,
+			IdxSize: seg.idx.sizeBytes(),
+		})
+	}
+	return out, nil
+}
+
+// SegmentKind selects which file of a segment ReadSegmentBytes
+// reads. SegmentLog is the records, SegmentIdx is the sparse index.
+type SegmentKind uint8
+
+const (
+	// SegmentLog addresses the segment's .log file.
+	SegmentLog SegmentKind = 0
+	// SegmentIdx addresses the segment's .idx file.
+	SegmentIdx SegmentKind = 1
+)
+
+// ReadSegmentBytes returns up to maxBytes from the addressed
+// segment file starting at offset. The byte range is read directly
+// from disk — appended-to active segments are safe to read because
+// the on-disk file grows monotonically and reads of [0, listedSize]
+// always return committed bytes.
+//
+// Returns nil bytes when offset is at or past the file's current
+// size; that's the end-of-stream signal for the chunked bootstrap
+// loop. Returns an error if the segment base is unknown.
+func (p *PartitionLog) ReadSegmentBytes(base int64, kind SegmentKind, offset int64, maxBytes int) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, nil
+	}
+	p.mu.RLock()
+	var path string
+	found := false
+	for _, seg := range p.segments {
+		if seg.baseOffset == base {
+			if kind == SegmentIdx {
+				path = seg.idxPath()
+			} else {
+				path = seg.logPath()
+			}
+			found = true
+			break
+		}
+	}
+	p.mu.RUnlock()
+	if !found {
+		return nil, fmt.Errorf("log: unknown segment base %d", base)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, 0); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, maxBytes)
+	n, err := f.Read(buf)
+	if err != nil && err.Error() != "EOF" {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
 // Append serializes r and writes it to the active segment. The broker
 // supplies r.Offset; PartitionLog only persists what it is given.
 // Rollover happens when the active segment reaches maxBytes.

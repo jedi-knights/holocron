@@ -3,6 +3,8 @@ package streams_test
 import (
 	"bytes"
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -790,6 +792,722 @@ func produceTimestamped(t *testing.T, b *embed.Broker, topic string, recs []prot
 		if _, err := p.Send(ctx, topic, r); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestStream_FilterNot_InvertsPredicate proves FilterNot is the
+// negation of Filter — records where the predicate returns true
+// are dropped, the rest pass through.
+func TestStream_FilterNot_InvertsPredicate(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"input", "output"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	top.Stream("input").
+		FilterNot(func(r proto.Record) bool {
+			return string(r.Value) == "skip"
+		}).
+		To("output")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act
+	produce(t, b, "input", []struct{ Key, Value string }{
+		{"k", "keep1"}, {"k", "skip"}, {"k", "keep2"},
+	})
+
+	// Assert — only the two non-"skip" records flow through.
+	got := collect(t, b, "output", 2, 3*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("got %d records, want 2", len(got))
+	}
+	for _, r := range got {
+		if string(r.Value) == "skip" {
+			t.Errorf("FilterNot let through a record it should have dropped: %q", r.Value)
+		}
+	}
+}
+
+// TestStream_GroupBy_AggregatesByDerivedKey proves GroupBy
+// derives the aggregation key from a function applied to each
+// record, then Count tallies under that key. Different records
+// that hash to the same derived key share one count slot.
+func TestStream_GroupBy_AggregatesByDerivedKey(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"input", "output"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Group by first byte of the value — so "apple"/"avocado"/"ant"
+	// all roll up under "a".
+	top.Stream("input").
+		GroupBy(func(r proto.Record) []byte {
+			if len(r.Value) > 0 {
+				return r.Value[:1]
+			}
+			return r.Value
+		}).
+		Count("first-letter").
+		To("output")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act
+	produce(t, b, "input", []struct{ Key, Value string }{
+		{"k", "apple"}, {"k", "avocado"}, {"k", "ant"}, {"k", "banana"},
+	})
+
+	// Assert — final state: a=3, b=1.
+	got := collect(t, b, "output", 4, 3*time.Second)
+	if len(got) != 4 {
+		t.Fatalf("got %d records, want 4", len(got))
+	}
+	store := top.Store("first-letter")
+	a, _ := store.Get([]byte("a"))
+	bv, _ := store.Get([]byte("b"))
+	if streams.DecodeCount(a) != 3 {
+		t.Errorf("count(a): got %d, want 3", streams.DecodeCount(a))
+	}
+	if streams.DecodeCount(bv) != 1 {
+		t.Errorf("count(b): got %d, want 1", streams.DecodeCount(bv))
+	}
+}
+
+// TestStream_SelectKey_ReKeysRecords proves SelectKey replaces
+// each record's key with the function's return while preserving
+// value and headers.
+func TestStream_SelectKey_ReKeysRecords(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"input", "output"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	top.Stream("input").
+		SelectKey(func(r proto.Record) []byte {
+			return append([]byte("k:"), r.Value...)
+		}).
+		To("output")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act — produce with one key, observe re-keyed output.
+	produce(t, b, "input", []struct{ Key, Value string }{{"orig", "abc"}})
+
+	// Assert — output's key is derived from the value.
+	got := collect(t, b, "output", 1, 3*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if string(got[0].Key) != "k:abc" {
+		t.Errorf("key: got %q, want \"k:abc\"", got[0].Key)
+	}
+	if string(got[0].Value) != "abc" {
+		t.Errorf("value: got %q, want \"abc\" (preserved)", got[0].Value)
+	}
+}
+
+// TestStream_MapKeyValue_TransformsBoth proves MapKeyValue
+// updates key and value in one step while preserving headers.
+func TestStream_MapKeyValue_TransformsBoth(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"input", "output"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	top.Stream("input").
+		MapKeyValue(func(k, v []byte) ([]byte, []byte) {
+			return append([]byte("k:"), k...), bytes.ToUpper(v)
+		}).
+		To("output")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act
+	produce(t, b, "input", []struct{ Key, Value string }{{"orig", "abc"}})
+
+	// Assert
+	got := collect(t, b, "output", 1, 3*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if string(got[0].Key) != "k:orig" {
+		t.Errorf("key: got %q, want \"k:orig\"", got[0].Key)
+	}
+	if string(got[0].Value) != "ABC" {
+		t.Errorf("value: got %q, want \"ABC\"", got[0].Value)
+	}
+}
+
+// TestStream_MapValues_PreservesKey proves MapValues transforms
+// only the value; key and headers pass through untouched.
+func TestStream_MapValues_PreservesKey(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"input", "output"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	top.Stream("input").
+		MapValues(func(v []byte) []byte {
+			return bytes.ToUpper(v)
+		}).
+		To("output")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act
+	produce(t, b, "input", []struct{ Key, Value string }{{"k", "abc"}})
+
+	// Assert
+	got := collect(t, b, "output", 1, 3*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if string(got[0].Key) != "k" {
+		t.Errorf("key: got %q, want \"k\" (preserved)", got[0].Key)
+	}
+	if string(got[0].Value) != "ABC" {
+		t.Errorf("value: got %q, want \"ABC\"", got[0].Value)
+	}
+}
+
+// TestStream_Peek_FiresWithoutModification proves Peek's callback
+// runs for every record while the stream content passes through
+// unchanged.
+func TestStream_Peek_FiresWithoutModification(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"input", "output"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu     sync.Mutex
+		seen   []string
+		expect = []string{"v1", "v2", "v3"}
+	)
+	top.Stream("input").
+		Peek(func(r proto.Record) {
+			mu.Lock()
+			seen = append(seen, string(r.Value))
+			mu.Unlock()
+		}).
+		To("output")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act
+	produce(t, b, "input", []struct{ Key, Value string }{
+		{"k", "v1"}, {"k", "v2"}, {"k", "v3"},
+	})
+
+	// Assert — output got every record unchanged.
+	got := collect(t, b, "output", 3, 3*time.Second)
+	if len(got) != 3 {
+		t.Fatalf("got %d records, want 3", len(got))
+	}
+	for i, r := range got {
+		if string(r.Value) != expect[i] {
+			t.Errorf("output[%d]: got %q, want %q", i, r.Value, expect[i])
+		}
+	}
+	// Peek saw the same records.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 3 {
+		t.Fatalf("Peek saw %d records, want 3", len(seen))
+	}
+}
+
+// TestStream_Reduce_CombinesValuesPerKey proves Reduce folds
+// per-key values through the supplied associative function. The
+// first record establishes the accumulator; subsequent records'
+// values are combined into it. Final state matches the
+// concatenation of all values for each key.
+func TestStream_Reduce_CombinesValuesPerKey(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"input", "output"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	top.Stream("input").
+		GroupByKey().
+		Reduce("concat", func(accum, v []byte) []byte {
+			out := make([]byte, 0, len(accum)+1+len(v))
+			out = append(out, accum...)
+			out = append(out, '|')
+			return append(out, v...)
+		}).
+		To("output")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act — three records: a/b/a. The first "a" establishes the
+	// accumulator (no separator); the second "a" appends.
+	produce(t, b, "input", []struct{ Key, Value string }{
+		{"a", "1"}, {"b", "x"}, {"a", "2"},
+	})
+
+	// Assert — final state for "a" is "1|2"; "b" is "x".
+	got := collect(t, b, "output", 3, 3*time.Second)
+	if len(got) != 3 {
+		t.Fatalf("got %d outputs, want 3", len(got))
+	}
+	store := top.Store("concat")
+	a, _ := store.Get([]byte("a"))
+	bVal, _ := store.Get([]byte("b"))
+	if string(a) != "1|2" {
+		t.Errorf("key a: got %q, want \"1|2\"", a)
+	}
+	if string(bVal) != "x" {
+		t.Errorf("key b: got %q, want \"x\"", bVal)
+	}
+}
+
+// TestStream_Through_PersistsIntermediateTopic proves a record
+// produced through an intermediate topic surfaces at the final
+// sink with the upstream transform applied AND lands in the
+// intermediate topic for inspection. Sugar-equivalent to
+// `s.To(mid); topology.Stream(mid).chain.To(out)` but as one
+// fluent pipeline.
+func TestStream_Through_PersistsIntermediateTopic(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"input", "intermediate", "output"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	top.Stream("input").
+		Map(func(r proto.Record) proto.Record {
+			return proto.Record{Key: r.Key, Value: append([]byte("up:"), r.Value...)}
+		}).
+		Through("intermediate").
+		Map(func(r proto.Record) proto.Record {
+			return proto.Record{Key: r.Key, Value: append([]byte("dn:"), r.Value...)}
+		}).
+		To("output")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act
+	produce(t, b, "input", []struct{ Key, Value string }{{"k", "x"}})
+
+	// Assert — intermediate has the upstream-only transform.
+	mid := collect(t, b, "intermediate", 1, 3*time.Second)
+	if len(mid) != 1 || string(mid[0].Value) != "up:x" {
+		t.Fatalf("intermediate: got %q, want \"up:x\"", mid[0].Value)
+	}
+	// Output has both transforms applied.
+	out := collect(t, b, "output", 1, 3*time.Second)
+	if len(out) != 1 || string(out[0].Value) != "dn:up:x" {
+		t.Fatalf("output: got %q, want \"dn:up:x\"", out[0].Value)
+	}
+}
+
+// TestStream_Branch_RoutesByPredicate proves Stream.Branch fans
+// out a source pipeline into multiple sinks based on per-branch
+// predicates: each input record routes to the FIRST matching
+// branch, and records that match none are dropped.
+func TestStream_Branch_RoutesByPredicate(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"input", "alphas", "bravos"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	branches := top.Stream("input").Branch(
+		func(r proto.Record) bool { return string(r.Value) == "a" },
+		func(r proto.Record) bool { return string(r.Value) == "b" },
+	)
+	branches[0].To("alphas")
+	branches[1].To("bravos")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act — produce a mix of a, b, and c (c matches no branch).
+	produce(t, b, "input", []struct{ Key, Value string }{
+		{"k", "a"}, {"k", "b"}, {"k", "c"}, {"k", "a"}, {"k", "b"},
+	})
+
+	// Assert — alphas got 2 records, bravos got 2 records, and
+	// "c" was silently dropped from both.
+	gotAlpha := collect(t, b, "alphas", 2, 3*time.Second)
+	gotBravo := collect(t, b, "bravos", 2, 3*time.Second)
+	if len(gotAlpha) != 2 {
+		t.Errorf("alphas: got %d records, want 2", len(gotAlpha))
+	}
+	for _, r := range gotAlpha {
+		if string(r.Value) != "a" {
+			t.Errorf("alphas saw non-a: %q", r.Value)
+		}
+	}
+	if len(gotBravo) != 2 {
+		t.Errorf("bravos: got %d records, want 2", len(gotBravo))
+	}
+	for _, r := range gotBravo {
+		if string(r.Value) != "b" {
+			t.Errorf("bravos saw non-b: %q", r.Value)
+		}
+	}
+}
+
+// TestStream_LeftJoin_DeferredEmitNoDuplicate proves the
+// window-close-and-emit fix from batch 31: a left record arrives
+// without a buffered right counterpart, then a matching right
+// arrives within the window. Pre-batch-31 the left would surface
+// twice — once as no-match at arrival, once as a matched pair
+// when the right paired up. The fix defers the no-match emission
+// until the window closes; the right's arrival removes the left
+// from pending, so only the matched pair fires.
+func TestStream_LeftJoin_DeferredEmitNoDuplicate(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"clicks", "impressions", "joined"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport(),
+		streams.WithIdleWatermark(50*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := top.Stream("clicks")
+	right := top.Stream("impressions")
+	left.LeftJoin(right, 500*time.Millisecond, func(l proto.Record, r *proto.Record) proto.Record {
+		out := proto.Record{Key: l.Key}
+		if r == nil {
+			out.Value = []byte("nomatch:" + string(l.Value))
+		} else {
+			out.Value = []byte("match:" + string(l.Value) + "|" + string(r.Value))
+		}
+		return out
+	}).To("joined")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act — left first, right shortly after (within 500ms window).
+	produce(t, b, "clicks", []struct{ Key, Value string }{{"k", "L1"}})
+	time.Sleep(50 * time.Millisecond)
+	produce(t, b, "impressions", []struct{ Key, Value string }{{"k", "R1"}})
+
+	// Wait long enough that any deferred no-match would have
+	// fired (window=500ms, punctuator=100ms).
+	time.Sleep(800 * time.Millisecond)
+
+	// Assert — exactly one record on the joined topic, the
+	// matched pair. With the V1 (pre-fix) emit-on-arrival
+	// semantic, a "nomatch:L1" would also have landed.
+	c, err := sdk.NewConsumer(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	subCtx, subCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer subCancel()
+	if err := c.Subscribe(subCtx, "joined", 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Poll(subCtx, 10)
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		values := make([]string, len(got))
+		for i, r := range got {
+			values[i] = string(r.Value)
+		}
+		t.Fatalf("got %d outputs, want 1 (records: %v)", len(got), values)
+	}
+	if string(got[0].Value) != "match:L1|R1" {
+		t.Errorf("output: got %q, want \"match:L1|R1\"", got[0].Value)
+	}
+}
+
+// TestStream_OuterJoin_LeftNoMatchEmits proves a left record
+// without a matching right surfaces as a no-match output. Same
+// shape as the LeftJoin test, but exercises the OuterJoin path.
+func TestStream_OuterJoin_LeftNoMatchEmits(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"clicks", "impressions", "joined"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport(),
+		streams.WithIdleWatermark(50*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := top.Stream("clicks")
+	right := top.Stream("impressions")
+	left.OuterJoin(right, 200*time.Millisecond, func(l, r *proto.Record) proto.Record {
+		switch {
+		case l != nil && r != nil:
+			return proto.Record{Key: l.Key, Value: []byte("match:" + string(l.Value) + "|" + string(r.Value))}
+		case l != nil:
+			return proto.Record{Key: l.Key, Value: []byte("left-only:" + string(l.Value))}
+		default:
+			return proto.Record{Key: r.Key, Value: []byte("right-only:" + string(r.Value))}
+		}
+	}).To("joined")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act — left only, no right ever. The idle-watermark goroutine
+	// will advance the watermark past left's eventTime + window, at
+	// which point the join punctuator flushes the no-match output.
+	produce(t, b, "clicks", []struct{ Key, Value string }{{"k", "L1"}})
+
+	// Assert — exactly one left-only output.
+	got := collect(t, b, "joined", 1, 3*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("got %d outputs, want 1", len(got))
+	}
+	if !startsWith(string(got[0].Value), "left-only:") {
+		t.Errorf("expected left-only output, got %q", got[0].Value)
+	}
+}
+
+// TestStream_OuterJoin_RightNoMatchEmits is the symmetric case:
+// a right record without a matching left also surfaces — this is
+// what distinguishes FULL outer from LEFT outer.
+func TestStream_OuterJoin_RightNoMatchEmits(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"clicks", "impressions", "joined"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport(),
+		streams.WithIdleWatermark(50*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := top.Stream("clicks")
+	right := top.Stream("impressions")
+	left.OuterJoin(right, 200*time.Millisecond, func(l, r *proto.Record) proto.Record {
+		switch {
+		case l != nil && r != nil:
+			return proto.Record{Key: l.Key, Value: []byte("match")}
+		case l != nil:
+			return proto.Record{Key: l.Key, Value: []byte("left-only:" + string(l.Value))}
+		default:
+			return proto.Record{Key: r.Key, Value: []byte("right-only:" + string(r.Value))}
+		}
+	}).To("joined")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act — right only, no left ever. LeftJoin would silently drop
+	// this; OuterJoin must emit a right-only output once the
+	// idle-watermark advance + join punctuator close the window.
+	produce(t, b, "impressions", []struct{ Key, Value string }{{"k", "R1"}})
+
+	// Assert
+	got := collect(t, b, "joined", 1, 3*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("got %d outputs, want 1", len(got))
+	}
+	if !startsWith(string(got[0].Value), "right-only:") {
+		t.Errorf("expected right-only output, got %q", got[0].Value)
+	}
+}
+
+// TestStream_LeftJoin_NoMatchEmits proves the LeftJoin emits a
+// no-match output for a left record that finds no matching right
+// counterpart at all — inner Join would silently drop it. Uses
+// only a left input (no right) so the no-match path is the only
+// possible output, eliminating the race between left- and right-
+// side consumers in the join pipeline.
+func TestStream_LeftJoin_NoMatchEmits(t *testing.T) {
+	// Arrange
+	b := embed.NewMemory()
+	defer b.Close()
+	for _, n := range []string{"clicks", "impressions", "joined"} {
+		if err := b.CreateTopic(embed.TopicSpec{Name: n, PartitionCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := streams.New(b.Transport(),
+		streams.WithIdleWatermark(50*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := top.Stream("clicks")
+	right := top.Stream("impressions")
+	left.LeftJoin(right, 200*time.Millisecond, func(l proto.Record, r *proto.Record) proto.Record {
+		out := proto.Record{Key: l.Key}
+		if r == nil {
+			out.Value = []byte("nomatch:" + string(l.Value))
+		} else {
+			out.Value = []byte("match:" + string(l.Value) + "|" + string(r.Value))
+		}
+		return out
+	}).To("joined")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := top.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer top.Stop()
+
+	// Act — produce only on the left side. With no right ever
+	// arriving, the no-match emission fires when the join's
+	// punctuator goroutine sees the watermark close the window.
+	produce(t, b, "clicks", []struct{ Key, Value string }{{"k", "L1"}})
+
+	// Assert — exactly one no-match output. An inner Join would
+	// silently drop this record.
+	got := collect(t, b, "joined", 1, 3*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("got %d outputs, want 1 (no-match emission missed)", len(got))
+	}
+	if !startsWith(string(got[0].Value), "nomatch:") {
+		t.Errorf("expected no-match output, got %q", got[0].Value)
 	}
 }
 

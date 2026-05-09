@@ -30,6 +30,13 @@ type index struct {
 // newIndex returns an empty index.
 func newIndex() *index { return &index{} }
 
+// sizeBytes is the on-disk byte size the index would serialize to —
+// indexEntrySize per logged entry. Used by the data-dir bootstrap
+// path to capture a consistent listed size at snapshot time.
+func (i *index) sizeBytes() int64 {
+	return int64(len(i.entries)) * indexEntrySize
+}
+
 // add appends an entry. Entries must be added in monotonically increasing
 // offset order; this is enforced by the caller (segment write path).
 func (i *index) add(relOffset, pos uint32) {

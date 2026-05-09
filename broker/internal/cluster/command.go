@@ -27,6 +27,14 @@ const (
 	CmdAppend CommandKind = 1
 	// CmdCreateTopic registers a topic with the given spec.
 	CmdCreateTopic CommandKind = 2
+	// CmdDeleteTopic removes a topic from the registry and tells the
+	// store to drop every partition's segments. Replicated through
+	// Raft so every node converges on the same topic set.
+	CmdDeleteTopic CommandKind = 3
+	// CmdUpdateTopicConfig changes a topic's retention and segment
+	// settings. Partition count is immutable; only the soft knobs
+	// are touched.
+	CmdUpdateTopicConfig CommandKind = 4
 )
 
 // AppendCommand is the FSM payload for an append.
@@ -70,6 +78,61 @@ func EncodeCreateTopic(c CreateTopicCommand) []byte {
 	buf = binary.BigEndian.AppendUint64(buf, uint64(c.RetentionMs))
 	buf = binary.BigEndian.AppendUint64(buf, uint64(c.SegmentBytes))
 	return buf
+}
+
+// UpdateTopicConfigCommand is the FSM payload for a topic-config
+// update. Retention/segment settings are mutable; partition count
+// is not.
+type UpdateTopicConfigCommand struct {
+	Name         string
+	RetentionMs  int64
+	SegmentBytes int64
+}
+
+// EncodeUpdateTopicConfig serializes an UpdateTopicConfigCommand.
+func EncodeUpdateTopicConfig(c UpdateTopicConfigCommand) []byte {
+	buf := []byte{byte(CmdUpdateTopicConfig)}
+	buf = appendString(buf, c.Name)
+	buf = binary.BigEndian.AppendUint64(buf, uint64(c.RetentionMs))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(c.SegmentBytes))
+	return buf
+}
+
+// DecodeUpdateTopicConfig parses an UpdateTopicConfigCommand body.
+func DecodeUpdateTopicConfig(body []byte) (UpdateTopicConfigCommand, error) {
+	name, n, err := readString(body)
+	if err != nil {
+		return UpdateTopicConfigCommand{}, fmt.Errorf("cluster: update-topic name: %w", err)
+	}
+	body = body[n:]
+	if len(body) < 16 {
+		return UpdateTopicConfigCommand{}, errors.New("cluster: short update-topic command")
+	}
+	return UpdateTopicConfigCommand{
+		Name:         name,
+		RetentionMs:  int64(binary.BigEndian.Uint64(body[0:8])),
+		SegmentBytes: int64(binary.BigEndian.Uint64(body[8:16])),
+	}, nil
+}
+
+// DeleteTopicCommand is the FSM payload for a topic deletion.
+type DeleteTopicCommand struct {
+	Name string
+}
+
+// EncodeDeleteTopic serializes a DeleteTopicCommand.
+func EncodeDeleteTopic(c DeleteTopicCommand) []byte {
+	buf := []byte{byte(CmdDeleteTopic)}
+	return appendString(buf, c.Name)
+}
+
+// DecodeDeleteTopic parses a DeleteTopicCommand body.
+func DecodeDeleteTopic(body []byte) (DeleteTopicCommand, error) {
+	name, _, err := readString(body)
+	if err != nil {
+		return DeleteTopicCommand{}, fmt.Errorf("cluster: delete-topic name: %w", err)
+	}
+	return DeleteTopicCommand{Name: name}, nil
 }
 
 // Decode parses the leading kind byte and returns the kind plus the

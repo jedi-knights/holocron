@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -146,6 +147,32 @@ func (s *FileStore) snapshotLogs() []*log.PartitionLog {
 	return out
 }
 
+// DeleteTopic removes every partition's PartitionLog for topic from
+// memory and rm's the on-disk topic directory. Errors during file
+// removal are best-effort — the in-memory state always clears so a
+// subsequent Append against a re-created topic of the same name
+// starts from a clean partition log.
+func (s *FileStore) DeleteTopic(ctx context.Context, topic string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	for p, l := range s.logs {
+		if p.Topic != topic {
+			continue
+		}
+		_ = l.Close()
+		delete(s.logs, p)
+	}
+	s.mu.Unlock()
+
+	dir := filepath.Join(s.root, topic)
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("storage: rm %s: %w", dir, err)
+	}
+	return nil
+}
+
 // Sync fsyncs the active segment of the partition to disk. The
 // PartitionLog opens lazily; if nothing has been written to this
 // partition yet, Sync is a no-op.
@@ -161,6 +188,77 @@ func (s *FileStore) Sync(ctx context.Context, p proto.PartitionRef) error {
 	}
 	return plog.Sync()
 }
+
+// SegmentInfo describes one segment in a partition snapshot: the
+// base offset and the .log / .idx file sizes captured at snapshot
+// time. A follower reads each file in chunks, never going past the
+// listed size, to observe a self-consistent prefix of an
+// arbitrarily large or even-still-being-appended segment.
+type SegmentInfo struct {
+	Base    int64
+	LogSize int64
+	IdxSize int64
+}
+
+// ListSegments returns the segment manifest for the partition,
+// ordered by ascending base offset. The last entry corresponds to
+// the active segment — its sizes reflect the bytes available to
+// read at snapshot time. Used by the data-dir bootstrap path so a
+// follower can iterate over segments and chunk-fetch each file.
+func (s *FileStore) ListSegments(ctx context.Context, p proto.PartitionRef) ([]SegmentInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	plog, err := s.openLog(p)
+	if err != nil {
+		return nil, err
+	}
+	snaps, err := plog.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SegmentInfo, len(snaps))
+	for i, sn := range snaps {
+		out[i] = SegmentInfo{Base: sn.Base, LogSize: sn.LogSize, IdxSize: sn.IdxSize}
+	}
+	return out, nil
+}
+
+// FetchSegmentChunk returns a byte range from the addressed segment
+// file. The (base, kind) pair selects the file; (offset, maxBytes)
+// bounds the read. Returns nil bytes when offset is at or past the
+// file's end — the chunked-read loop's terminator. Caller bounds
+// reads by the size returned in ListSegments to avoid reading past
+// the consistent prefix.
+func (s *FileStore) FetchSegmentChunk(ctx context.Context, p proto.PartitionRef, base int64, kind log.SegmentKind, offset int64, maxBytes int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	plog, err := s.openLog(p)
+	if err != nil {
+		return nil, err
+	}
+	return plog.ReadSegmentBytes(base, kind, offset, maxBytes)
+}
+
+// SegmentFileName returns the canonical filename for a segment
+// component (e.g. "00000000000000000123.log") so callers writing a
+// chunked snapshot to a fresh data dir know where to land each
+// chunk.
+func SegmentFileName(base int64, kind log.SegmentKind) string {
+	return log.SegmentFileName(base, kind)
+}
+
+// PartitionDir returns the canonical directory layout the FileStore
+// uses for a partition's segments. Re-exported so the bootstrap
+// helper can address the right path without importing the log
+// package.
+func PartitionDir(root string, p proto.PartitionRef) string {
+	return log.PartitionDir(root, p)
+}
+
+// silence path/filepath unused-import lint in some compile paths.
+var _ = filepath.Join
 
 // Close flushes and closes every open partition log.
 func (s *FileStore) Close() error {

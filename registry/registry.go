@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,6 +18,17 @@ import (
 // topic should have exactly one partition so total order across all
 // subjects is preserved (and so schema-ID assignment is monotonic).
 const DefaultTopic = "__holocron_schemas"
+
+// Reserved record headers that distinguish operational records on
+// the schemas topic from regular schema registrations. A normal
+// register record carries no headers; a delete-version record
+// carries both headers below.
+const (
+	headerRegistryOp        = "holocron.registry.op"
+	headerRegistryVersion   = "holocron.registry.version"
+	registryOpDeleteVersion = "delete_version"
+	registryOpConfig        = "config"
+)
 
 // Compatibility mode — V1 ships only NONE. The API accommodates the
 // other modes so callers can record their intent; enforcement of
@@ -56,10 +68,18 @@ type Service struct {
 	mu        sync.RWMutex
 	byID      map[int]Schema
 	bySubject map[string][]Schema // ordered by version, ascending
+	compats   map[string]Compatibility
 	nextID    int
 
 	producer *sdk.Producer
 	started  bool
+}
+
+// configRecord is the wire shape for per-subject compatibility
+// updates. Stored as the value of a header-marked record on the
+// schemas topic so a fresh replay rebuilds the same compats map.
+type configRecord struct {
+	Compatibility Compatibility `json:"compatibility"`
 }
 
 // Option configures a Service.
@@ -82,6 +102,7 @@ func New(transport sdk.Transport, opts ...Option) (*Service, error) {
 		topic:     DefaultTopic,
 		byID:      make(map[int]Schema),
 		bySubject: make(map[string][]Schema),
+		compats:   make(map[string]Compatibility),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -225,9 +246,74 @@ func (s *Service) applyTombstoneLocked(subject string) {
 	delete(s.bySubject, subject)
 }
 
+// applyConfigLocked records a per-subject compatibility mode in
+// the in-memory map. Empty / NONE entries are dropped from the
+// map so GetCompatibility returns the documented default.
+func (s *Service) applyConfigLocked(subject string, mode Compatibility) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if mode == "" || mode == CompatibilityNone {
+		delete(s.compats, subject)
+		return
+	}
+	s.compats[subject] = mode
+}
+
+// applyDeleteVersionLocked drops one specific version from a
+// subject. The version's schema disappears from bySubject and its
+// ID is removed from byID; remaining versions keep their numbers
+// (gaps are valid — Confluent Schema Registry has the same
+// semantic). If the subject's last version is deleted, the
+// subject's slice is removed entirely so ListSubjects no longer
+// surfaces it.
+func (s *Service) applyDeleteVersionLocked(subject string, version int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	versions := s.bySubject[subject]
+	for i, sc := range versions {
+		if sc.Version != version {
+			continue
+		}
+		delete(s.byID, sc.ID)
+		versions = append(versions[:i], versions[i+1:]...)
+		if len(versions) == 0 {
+			delete(s.bySubject, subject)
+		} else {
+			s.bySubject[subject] = versions
+		}
+		return
+	}
+}
+
+// headerValue returns the string value of the first header with
+// the given key, or ("", false) if absent.
+func headerValue(headers []proto.Header, key string) (string, bool) {
+	for _, h := range headers {
+		if h.Key == key {
+			return string(h.Value), true
+		}
+	}
+	return "", false
+}
+
+// headerInt parses the header's value as a base-10 int. Used by
+// the delete-version path; returns false on parse failure.
+func headerInt(headers []proto.Header, key string) (int, bool) {
+	v, ok := headerValue(headers, key)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // applyRecord dispatches a replayed topic record to the right state
-// transition: tombstone (nil/empty value) deletes the subject; any
-// other value is decoded as a Schema and applied.
+// transition: tombstone (nil/empty value) deletes the subject; a
+// header-marked delete-version record drops one specific version;
+// any other value is decoded as a Schema and applied.
 //
 // Two pieces of state come from the broker, not from the record's
 // JSON, so multi-instance registries don't collide:
@@ -239,6 +325,24 @@ func (s *Service) applyTombstoneLocked(subject string) {
 // The Subject in the JSON is replaced with the record's key — the key
 // is the wire-stable identity, the JSON copy is informational only.
 func (s *Service) applyRecord(r proto.Record) error {
+	if op, ok := headerValue(r.Headers, headerRegistryOp); ok {
+		switch op {
+		case registryOpDeleteVersion:
+			v, ok := headerInt(r.Headers, headerRegistryVersion)
+			if !ok {
+				return fmt.Errorf("registry: delete-version record missing %s header", headerRegistryVersion)
+			}
+			s.applyDeleteVersionLocked(string(r.Key), v)
+			return nil
+		case registryOpConfig:
+			var cfg configRecord
+			if err := json.Unmarshal(r.Value, &cfg); err != nil {
+				return fmt.Errorf("registry: config replay decode: %w", err)
+			}
+			s.applyConfigLocked(string(r.Key), cfg.Compatibility)
+			return nil
+		}
+	}
 	if len(r.Value) == 0 {
 		s.applyTombstoneLocked(string(r.Key))
 		return nil
@@ -297,6 +401,26 @@ func (s *Service) Register(ctx context.Context, subject, schemaText string) (int
 	nextVersion := len(versions) + 1
 	s.mu.RUnlock()
 
+	// Enforce the configured compatibility mode before producing
+	// the registration record. Subjects without a mode (or set to
+	// NONE) skip the check; CheckCompatibility short-circuits in
+	// that case anyway, but we save the GetLatest round-trip by
+	// not invoking it.
+	if mode := s.GetCompatibility(subject); mode != CompatibilityNone && mode != "" {
+		ok, err := s.CheckCompatibility(subject, schemaText, mode)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			// CheckCompatibility returns (false, nil) only when it
+			// doesn't violate but flags the mode as invalid; the
+			// "violation" path already returns (false, err). This
+			// branch shouldn't trigger but is defensive against a
+			// future change.
+			return 0, fmt.Errorf("registry: schema rejected by compatibility check (mode=%s)", mode)
+		}
+	}
+
 	sc := Schema{
 		Subject: subject,
 		Version: nextVersion,
@@ -350,6 +474,117 @@ func (s *Service) DeleteSubject(ctx context.Context, subject string) error {
 	return nil
 }
 
+// SetCompatibility persists the compatibility mode for subject by
+// writing a header-marked config record to the schemas topic and
+// updating the in-memory map. Subsequent Register calls on the
+// subject automatically run CheckCompatibility under the
+// configured mode and reject incompatible schemas.
+//
+// CompatibilityNone (the default for unset subjects) clears the
+// per-subject mode — a NONE config record is durable and
+// idempotent across replays.
+//
+// Returns an error if mode isn't one of the recognized
+// Compatibility values.
+func (s *Service) SetCompatibility(ctx context.Context, subject string, mode Compatibility) error {
+	switch mode {
+	case CompatibilityNone, CompatibilityBackward, CompatibilityForward, CompatibilityFull:
+	default:
+		return fmt.Errorf("registry: unknown compatibility mode %q", mode)
+	}
+	body, err := json.Marshal(configRecord{Compatibility: mode})
+	if err != nil {
+		return err
+	}
+	rec := proto.Record{
+		Key:   []byte(subject),
+		Value: body,
+		Headers: []proto.Header{
+			{Key: headerRegistryOp, Value: []byte(registryOpConfig)},
+		},
+	}
+	if _, err := s.producer.Send(ctx, s.topic, rec); err != nil {
+		return fmt.Errorf("registry: produce config: %w", err)
+	}
+	s.applyConfigLocked(subject, mode)
+	return nil
+}
+
+// GetCompatibility returns the configured compatibility mode for
+// subject, or CompatibilityNone when no mode has been set.
+// Operators read this through the HTTP layer; Register reads it
+// before each schema registration to decide whether to enforce a
+// check.
+func (s *Service) GetCompatibility(subject string) Compatibility {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if m, ok := s.compats[subject]; ok {
+		return m
+	}
+	return CompatibilityNone
+}
+
+// DeleteByID removes the schema addressed by global ID by
+// resolving it to (subject, version) and writing a delete-version
+// marker. Returns ErrSchemaNotFound when the ID isn't registered.
+//
+// The (subject, version) form (DeleteVersion) is preferred for
+// human-driven cleanup; DeleteByID exists for tooling that holds
+// IDs as opaque references — caches, downstream pipelines that
+// recorded an ID at produce time and now need to reclaim it.
+func (s *Service) DeleteByID(ctx context.Context, id int) error {
+	s.mu.RLock()
+	sc, ok := s.byID[id]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("%w: id=%d", ErrSchemaNotFound, id)
+	}
+	return s.DeleteVersion(ctx, sc.Subject, sc.Version)
+}
+
+// DeleteVersion removes a single version of subject by writing a
+// header-marked delete-version record to the schemas topic. Other
+// versions of the subject remain registered; gaps in the version
+// sequence are valid (matches Confluent Schema Registry semantics).
+//
+// Returns ErrSubjectNotFound when the subject doesn't exist;
+// ErrVersionNotFound when the version isn't currently registered
+// under the subject. Idempotent across replays — a fresh Service
+// observing the record converges to the same gapped sequence.
+func (s *Service) DeleteVersion(ctx context.Context, subject string, version int) error {
+	s.mu.RLock()
+	versions, exists := s.bySubject[subject]
+	if !exists {
+		s.mu.RUnlock()
+		return fmt.Errorf("%w: %q", ErrSubjectNotFound, subject)
+	}
+	found := false
+	for _, sc := range versions {
+		if sc.Version == version {
+			found = true
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if !found {
+		return fmt.Errorf("%w: subject=%q version=%d", ErrVersionNotFound, subject, version)
+	}
+
+	rec := proto.Record{
+		Key:   []byte(subject),
+		Value: []byte("{}"), // non-empty so the record isn't a tombstone
+		Headers: []proto.Header{
+			{Key: headerRegistryOp, Value: []byte(registryOpDeleteVersion)},
+			{Key: headerRegistryVersion, Value: []byte(strconv.Itoa(version))},
+		},
+	}
+	if _, err := s.producer.Send(ctx, s.topic, rec); err != nil {
+		return fmt.Errorf("registry: produce delete-version: %w", err)
+	}
+	s.applyDeleteVersionLocked(subject, version)
+	return nil
+}
+
 // GetByID returns the schema with the given globally-unique ID.
 func (s *Service) GetByID(id int) (Schema, error) {
 	s.mu.RLock()
@@ -370,10 +605,16 @@ func (s *Service) GetVersion(subject string, version int) (Schema, error) {
 	if !ok || len(versions) == 0 {
 		return Schema{}, fmt.Errorf("%w: %q", ErrSubjectNotFound, subject)
 	}
-	if version < 1 || version > len(versions) {
-		return Schema{}, fmt.Errorf("%w: subject=%q version=%d", ErrVersionNotFound, subject, version)
+	// Linear scan rather than versions[version-1] — per-version
+	// delete leaves gaps in the version sequence (e.g. deleting
+	// version 2 from [1,2,3] leaves [1,3]), so the slice index no
+	// longer corresponds to version - 1.
+	for _, sc := range versions {
+		if sc.Version == version {
+			return sc, nil
+		}
 	}
-	return versions[version-1], nil
+	return Schema{}, fmt.Errorf("%w: subject=%q version=%d", ErrVersionNotFound, subject, version)
 }
 
 // GetLatest returns the most recently registered schema for the subject.
@@ -418,17 +659,105 @@ func (s *Service) ListVersions(subject string) ([]int, error) {
 // the current state of subject under the given mode. Stage 7 V1 only
 // understands NONE, which always returns true. Other modes return an
 // error so callers can detect the gap explicitly.
+//
+// Compatibility checks treat schemas as JSON Schema documents and
+// inspect the top-level "required" array as the field set the
+// schema enforces. The check is purely structural — it does not
+// validate types, descriptions, defaults, or nested objects.
+// Sufficient for the common "did we accidentally make a previously
+// optional field required" mistake; richer semantics need a
+// genuine JSON Schema parser, which is a follow-on.
+//
+//   - BACKWARD: a record valid under the existing latest schema
+//     must remain valid under the new schema. Concretely: the new
+//     schema's required-field set must be a subset of the old's.
+//     (You can drop required fields; you can't add new ones.)
+//   - FORWARD: a record valid under the new schema must remain
+//     valid under the existing latest schema. Inverse of BACKWARD.
+//   - FULL: both directions. Required-field sets must match
+//     exactly.
+//
+// Returns (true, nil) when compatible; (false, error) when the
+// rule is violated, with the error explaining which fields broke
+// it. Schemas that don't parse as JSON return an error rather than
+// silently passing.
 func (s *Service) CheckCompatibility(subject, schemaText string, mode Compatibility) (bool, error) {
-	_ = subject
-	_ = schemaText
-	switch mode {
-	case CompatibilityNone, "":
+	if mode == CompatibilityNone || mode == "" {
 		return true, nil
-	case CompatibilityBackward, CompatibilityForward, CompatibilityFull:
-		return false, fmt.Errorf("registry: compatibility mode %q not implemented in V1", mode)
-	default:
+	}
+	if mode != CompatibilityBackward && mode != CompatibilityForward && mode != CompatibilityFull {
 		return false, fmt.Errorf("registry: unknown compatibility mode %q", mode)
 	}
+
+	latest, err := s.GetLatest(subject)
+	if errors.Is(err, ErrSubjectNotFound) {
+		// First version is trivially compatible with itself.
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	oldRequired, err := requiredFields(latest.Schema)
+	if err != nil {
+		return false, fmt.Errorf("registry: parse existing schema: %w", err)
+	}
+	newRequired, err := requiredFields(schemaText)
+	if err != nil {
+		return false, fmt.Errorf("registry: parse candidate schema: %w", err)
+	}
+
+	switch mode {
+	case CompatibilityBackward:
+		if extra := setDiff(newRequired, oldRequired); len(extra) > 0 {
+			return false, fmt.Errorf("registry: BACKWARD violation — new schema requires fields absent from old: %v", extra)
+		}
+	case CompatibilityForward:
+		if extra := setDiff(oldRequired, newRequired); len(extra) > 0 {
+			return false, fmt.Errorf("registry: FORWARD violation — old schema requires fields absent from new: %v", extra)
+		}
+	case CompatibilityFull:
+		if extra := setDiff(newRequired, oldRequired); len(extra) > 0 {
+			return false, fmt.Errorf("registry: FULL violation (BACKWARD direction) — new schema requires fields absent from old: %v", extra)
+		}
+		if extra := setDiff(oldRequired, newRequired); len(extra) > 0 {
+			return false, fmt.Errorf("registry: FULL violation (FORWARD direction) — old schema requires fields absent from new: %v", extra)
+		}
+	}
+	return true, nil
+}
+
+// requiredFields parses schemaText as JSON and extracts the
+// top-level "required" array as a set of field names. Returns an
+// empty set when the schema parses but has no required field, and
+// an error when the JSON is malformed. Non-string entries in the
+// required array are skipped (defensive against authoring errors).
+func requiredFields(schemaText string) (map[string]struct{}, error) {
+	var doc struct {
+		Required []any `json:"required"`
+	}
+	if err := json.Unmarshal([]byte(schemaText), &doc); err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{}, len(doc.Required))
+	for _, v := range doc.Required {
+		if s, ok := v.(string); ok {
+			out[s] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// setDiff returns the keys in a that are not in b.
+func setDiff(a, b map[string]struct{}) []string {
+	out := make([]string, 0)
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Close releases the embedded Producer. The Transport is owned by the

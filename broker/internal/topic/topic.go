@@ -97,6 +97,51 @@ func (r *Registry) Create(spec Spec) error {
 	return nil
 }
 
+// UpdateConfig modifies the retention and segment-size settings of
+// an existing topic. PartitionCount is immutable — changing it
+// would break per-partition ordering for already-produced
+// records, so the operation is rejected at the wire layer.
+//
+// retentionMs and segmentBytes <= 0 mean "no change" so callers
+// can update one knob without disturbing the other. Returns
+// ErrTopicNotFound when the topic doesn't exist.
+func (r *Registry) UpdateConfig(name string, retentionMs, segmentBytes int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cfg, ok := r.topics[name]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrTopicNotFound, name)
+	}
+	if retentionMs > 0 {
+		cfg.RetentionMs = retentionMs
+	}
+	if segmentBytes > 0 {
+		cfg.SegmentBytes = segmentBytes
+	}
+	r.topics[name] = cfg
+	if r.persist != nil {
+		return r.persist(snapshotLocked(r.topics))
+	}
+	return nil
+}
+
+// Delete removes a topic from the registry and persists the new
+// snapshot. Returns ErrTopicNotFound when no topic by that name is
+// registered. Storage-level cleanup of segment files is the
+// caller's responsibility — the registry only owns metadata.
+func (r *Registry) Delete(name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.topics[name]; !ok {
+		return fmt.Errorf("%w: %q", ErrTopicNotFound, name)
+	}
+	delete(r.topics, name)
+	if r.persist != nil {
+		return r.persist(snapshotLocked(r.topics))
+	}
+	return nil
+}
+
 func snapshotLocked(m map[string]proto.TopicConfig) []proto.TopicConfig {
 	out := make([]proto.TopicConfig, 0, len(m))
 	for _, cfg := range m {

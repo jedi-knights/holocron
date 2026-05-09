@@ -51,7 +51,7 @@ func (t *recordingTransport) PartitionsFor(_ context.Context, _ string) (int32, 
 func (t *recordingTransport) JoinGroup(_ context.Context, _, _ string, _ []string) (sdk.JoinResult, error) {
 	return sdk.JoinResult{}, nil
 }
-func (t *recordingTransport) Heartbeat(_ context.Context, _, _ string, _ int32) (sdk.HeartbeatResult, error) {
+func (t *recordingTransport) Heartbeat(_ context.Context, _, _ string, _ int32, _ time.Duration) (sdk.HeartbeatResult, error) {
 	return sdk.HeartbeatResult{}, nil
 }
 func (t *recordingTransport) LeaveGroup(_ context.Context, _, _ string) error { return nil }
@@ -117,6 +117,96 @@ func TestProducer_Linger_BatchesWithinWindow(t *testing.T) {
 	defer tr.mu.Unlock()
 	if tr.batchSizes[0] != 5 {
 		t.Errorf("batch size: got %d, want 5", tr.batchSizes[0])
+	}
+}
+
+// TestProducer_OnSent_FiresPerRecord proves the OnSent hook
+// fires once per Send and once per record in SendBatch, with the
+// partition + offset the broker assigned. Provides instrumentation
+// for callers that want a synchronous record of every successful
+// produce.
+func TestProducer_OnSent_FiresPerRecord(t *testing.T) {
+	// Arrange — recordingTransport assigns offsets sequentially.
+	tr := newRecordingTransport(1)
+	type seen struct {
+		offset int64
+	}
+	var (
+		mu   sync.Mutex
+		hits []seen
+	)
+	p, err := sdk.NewProducer(tr, sdk.WithOnSent(func(_ proto.PartitionRef, off int64) {
+		mu.Lock()
+		hits = append(hits, seen{off})
+		mu.Unlock()
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// Act — three Sends + one SendBatch of two.
+	for range 3 {
+		if _, err := p.Send(context.Background(), "t", proto.Record{Value: []byte("v")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := p.SendBatch(context.Background(), "t", []proto.Record{
+		{Value: []byte("a")}, {Value: []byte("b")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert — 3 single-Send hits + 2 batch hits = 5.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hits) != 5 {
+		t.Fatalf("hook fired %d times, want 5", len(hits))
+	}
+}
+
+// TestProducer_SendNoWait_ReturnsBeforeFlush proves SendNoWait
+// returns immediately even with a long linger window. The records
+// don't reach the transport until the linger expires (or Flush is
+// called) — fire-and-forget semantics for telemetry firehoses.
+func TestProducer_SendNoWait_ReturnsBeforeFlush(t *testing.T) {
+	// Arrange
+	tr := newRecordingTransport(1)
+	p, err := sdk.NewProducer(tr,
+		sdk.WithLinger(10*time.Second), // long linger
+		sdk.WithBatchSize(100),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// Act — five fire-and-forget sends.
+	for range 5 {
+		if err := p.SendNoWait(context.Background(), "t", proto.Record{Value: []byte("v")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Assert — none have reached the wire yet (long linger).
+	if got := atomic.LoadInt32(&tr.batchCalls); got != 0 {
+		t.Fatalf("batch calls before flush: got %d, want 0 (linger window holds them)", got)
+	}
+
+	// Flush forces the drain. Now they should land.
+	if err := p.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&tr.batchCalls); got != 1 {
+		t.Fatalf("batch calls after flush: got %d, want 1", got)
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.batchSizes[0] != 5 {
+		t.Errorf("batch size: got %d, want 5", tr.batchSizes[0])
+	}
+	if errs := p.AsyncErrors(); errs != 0 {
+		t.Errorf("AsyncErrors: got %d, want 0 (no failures)", errs)
 	}
 }
 

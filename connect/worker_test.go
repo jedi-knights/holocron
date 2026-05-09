@@ -335,6 +335,66 @@ func collectFromTopic(t *testing.T, b *embed.Broker, topic string, want int, tim
 	return got
 }
 
+// TestWorker_StatsTracksSourceThroughput proves the per-task
+// stats counters tally every successfully produced record from a
+// source task. Records and Bytes both grow with each delivery.
+func TestWorker_StatsTracksSourceThroughput(t *testing.T) {
+	// Arrange
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "in.txt")
+	lines := []string{"alpha", "bravo", "charlie"}
+	if err := os.WriteFile(srcPath, []byte(joinLines(lines)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := embed.NewMemory()
+	defer b.Close()
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := connect.NewWorker(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddSource(file.NewSource(file.SourceConfig{
+		Name:  "stat-source",
+		Path:  srcPath,
+		Topic: "events",
+	}), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	// Act — drain the records so the source task sends all 3.
+	got := collectFromTopic(t, b, "events", 3, 3*time.Second)
+	if len(got) != 3 {
+		t.Fatalf("got %d records, want 3", len(got))
+	}
+
+	// Assert — Stats reports the source task's counters.
+	stats := w.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("stats entries: got %d, want 1 (entries=%v)", len(stats), stats)
+	}
+	if stats[0].Connector != "stat-source" || stats[0].TaskIndex != 0 {
+		t.Errorf("stat: got (%s, %d), want (stat-source, 0)", stats[0].Connector, stats[0].TaskIndex)
+	}
+	if stats[0].Records != 3 {
+		t.Errorf("Records: got %d, want 3", stats[0].Records)
+	}
+	// Bytes = sum of "alpha"+"bravo"+"charlie" = 5+5+7 = 17.
+	if stats[0].Bytes != 17 {
+		t.Errorf("Bytes: got %d, want 17", stats[0].Bytes)
+	}
+}
+
 // TestWorker_OffsetStoreResumesAfterRestart proves source-task offsets
 // persist across worker restarts via WithOffsetStore. Two workers run
 // against the same file source, separated by a Stop. Across the pair

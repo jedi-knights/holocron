@@ -43,7 +43,7 @@ func (t *flakyTransport) PartitionsFor(_ context.Context, _ string) (int32, erro
 func (t *flakyTransport) JoinGroup(_ context.Context, _, _ string, _ []string) (sdk.JoinResult, error) {
 	return sdk.JoinResult{}, nil
 }
-func (t *flakyTransport) Heartbeat(_ context.Context, _, _ string, _ int32) (sdk.HeartbeatResult, error) {
+func (t *flakyTransport) Heartbeat(_ context.Context, _, _ string, _ int32, _ time.Duration) (sdk.HeartbeatResult, error) {
 	return sdk.HeartbeatResult{}, nil
 }
 func (t *flakyTransport) LeaveGroup(_ context.Context, _, _ string) error { return nil }

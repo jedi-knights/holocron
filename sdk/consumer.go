@@ -56,7 +56,7 @@ type Consumer struct {
 
 	mu         sync.Mutex
 	fanIn      chan inflight
-	pumpCancel []context.CancelFunc
+	pumpCancel map[proto.PartitionRef]context.CancelFunc
 	latest     map[proto.PartitionRef]int64 // highest offset seen per assigned partition
 	assignment []proto.PartitionRef          // current assignment (for revoke callback)
 	closed     bool
@@ -276,13 +276,35 @@ func appendUnique(seen []string, v string) []string {
 // the returned error after any already-buffered records are drained
 // from this call.
 func (c *Consumer) Poll(ctx context.Context, maxRecords int) ([]proto.Record, error) {
+	polled, err := c.PollMeta(ctx, maxRecords)
+	if polled == nil {
+		return nil, err
+	}
+	out := make([]proto.Record, len(polled))
+	for i, p := range polled {
+		out[i] = p.Record
+	}
+	return out, err
+}
+
+// PolledRecord pairs a record with the partition it was fetched from.
+// PollMeta returns these so callers that route per-partition state
+// (e.g. the streams runtime's per-partition state stores) can scope
+// state operations to the originating partition.
+type PolledRecord struct {
+	Record    proto.Record
+	Partition proto.PartitionRef
+}
+
+// PollMeta is like Poll but returns each record with its source
+// partition. All other semantics — blocking on the first record,
+// dropping records from revoked partitions, surfacing protocol-level
+// errors after draining already-buffered records — match Poll.
+func (c *Consumer) PollMeta(ctx context.Context, maxRecords int) ([]PolledRecord, error) {
 	if maxRecords <= 0 {
 		return nil, nil
 	}
-	out := make([]proto.Record, 0, maxRecords)
-	// Block until at least one currently-assigned record arrives or
-	// ctx fires. Stale records (from revoked partitions) are dropped
-	// silently and do not satisfy the "first record" wait.
+	out := make([]PolledRecord, 0, maxRecords)
 	for len(out) == 0 {
 		select {
 		case in, ok := <-c.fanIn:
@@ -295,7 +317,7 @@ func (c *Consumer) Poll(ctx context.Context, maxRecords int) ([]proto.Record, er
 			if !c.isCurrentlyAssigned(in.partition) {
 				continue
 			}
-			out = append(out, in.rec)
+			out = append(out, PolledRecord{Record: in.rec, Partition: in.partition})
 		case <-ctx.Done():
 			return out, ctx.Err()
 		}
@@ -312,7 +334,7 @@ func (c *Consumer) Poll(ctx context.Context, maxRecords int) ([]proto.Record, er
 			if !c.isCurrentlyAssigned(in.partition) {
 				continue
 			}
-			out = append(out, in.rec)
+			out = append(out, PolledRecord{Record: in.rec, Partition: in.partition})
 		default:
 			return out, nil
 		}
@@ -434,12 +456,24 @@ func (c *Consumer) startPump(ctx context.Context, p proto.PartitionRef, fromOffs
 		return errors.New("sdk: consumer is closed")
 	}
 	pumpCtx, cancel := context.WithCancel(ctx)
-	c.pumpCancel = append(c.pumpCancel, cancel)
+	if c.pumpCancel == nil {
+		c.pumpCancel = make(map[proto.PartitionRef]context.CancelFunc)
+	}
+	// Cancel any prior pump for the same partition (pause/resume,
+	// rebalance restart on the same partition) so we don't leak a
+	// goroutine still pumping into fanIn.
+	if prior, ok := c.pumpCancel[p]; ok {
+		prior()
+	}
+	c.pumpCancel[p] = cancel
 	c.mu.Unlock()
 
 	ch, errCh, err := c.transport.Subscribe(pumpCtx, p, fromOffset)
 	if err != nil {
 		cancel()
+		c.mu.Lock()
+		delete(c.pumpCancel, p)
+		c.mu.Unlock()
 		return fmt.Errorf("sdk: subscribe %v: %w", p, err)
 	}
 	go c.pump(pumpCtx, p, ch, errCh)
@@ -490,6 +524,54 @@ func (c *Consumer) recordLatest(p proto.PartitionRef, offset int64) {
 	c.mu.Unlock()
 }
 
+// Pause stops fetching from p without leaving the group. The
+// partition stays in this consumer's assignment so a rebalance
+// won't move it; it just halts the per-partition pump goroutine
+// so no records arrive. Resume restarts the pump from the offset
+// just past the last record this consumer saw.
+//
+// Useful for backpressure: when a downstream sink is overwhelmed,
+// Pause the source partition until the sink catches up. Records
+// produced to the broker while paused accumulate there and stream
+// down on Resume.
+//
+// Returns nil for an unknown partition (idempotent — a Pause
+// after Resume is a no-op).
+func (c *Consumer) Pause(p proto.PartitionRef) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return errors.New("sdk: consumer is closed")
+	}
+	if cancel, ok := c.pumpCancel[p]; ok {
+		cancel()
+		delete(c.pumpCancel, p)
+	}
+	return nil
+}
+
+// Resume restarts a paused partition's pump from the offset just
+// past the last record this consumer observed. If no records have
+// been seen, resumes from the supplied fallback offset (typically
+// 0). Returns an error if the partition was never assigned.
+func (c *Consumer) Resume(ctx context.Context, p proto.PartitionRef, fallback int64) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return errors.New("sdk: consumer is closed")
+	}
+	from := fallback
+	if last, ok := c.latest[p]; ok {
+		from = last + 1
+	}
+	if _, alreadyRunning := c.pumpCancel[p]; alreadyRunning {
+		c.mu.Unlock()
+		return nil // idempotent
+	}
+	c.mu.Unlock()
+	return c.startPump(ctx, p, from)
+}
+
 // LatestOffsets returns a snapshot of the highest offset received per
 // assigned partition since this Consumer was created. Used by callers
 // (e.g. the connect Worker) that auto-commit on a flush boundary.
@@ -526,28 +608,39 @@ func (c *Consumer) startHeartbeatLocked(parent context.Context) {
 
 func (c *Consumer) heartbeatLoop(ctx context.Context, done chan<- struct{}) {
 	defer close(done)
-	ticker := time.NewTicker(c.heartbeatInterval)
-	defer ticker.Stop()
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case <-ticker.C:
-			c.mu.Lock()
-			group := c.group
-			memberID := c.memberID
-			generation := c.generation
-			closed := c.closed
-			c.mu.Unlock()
-			if closed || group == "" || memberID == "" {
+		}
+		c.mu.Lock()
+		group := c.group
+		memberID := c.memberID
+		generation := c.generation
+		closed := c.closed
+		wait := c.heartbeatInterval
+		c.mu.Unlock()
+		if closed || group == "" || memberID == "" {
+			// No active membership — sleep a tick before re-checking.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
 				continue
 			}
-			res, err := c.transport.Heartbeat(ctx, group, memberID, generation)
-			if err != nil || res.RebalanceNeeded {
-				// Rejoin synchronously in this goroutine so partition
-				// pumps are reshaped before more records are fetched.
-				_ = c.rejoin(ctx)
-			}
+		}
+
+		// Each heartbeat is a long-poll: the broker holds the call
+		// open for up to wait, returning immediately when a rebalance
+		// is needed. This delivers the server-pushed rebalance signal
+		// the moment a peer joins or leaves, rather than after a
+		// ticker tick. heartbeatInterval is reused as the long-poll
+		// deadline so the existing tuning still applies.
+		res, err := c.transport.Heartbeat(ctx, group, memberID, generation, wait)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		if err != nil || res.RebalanceNeeded {
+			_ = c.rejoin(ctx)
 		}
 	}
 }

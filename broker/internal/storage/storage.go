@@ -22,5 +22,11 @@ type Store interface {
 	// storage. Used by acks=durable producers; in-memory stores treat
 	// it as a no-op.
 	Sync(ctx context.Context, p proto.PartitionRef) error
+	// DeleteTopic removes every partition's records and segment files
+	// for the named topic. Used when the broker drops a topic so the
+	// underlying storage doesn't accumulate orphaned bytes. In-memory
+	// stores discard the in-RAM map; file-backed stores rm the
+	// per-topic directory tree.
+	DeleteTopic(ctx context.Context, topic string) error
 	Close() error
 }

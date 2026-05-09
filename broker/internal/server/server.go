@@ -22,6 +22,8 @@ import (
 
 	"github.com/jedi-knights/holocron/broker/internal/broker"
 	"github.com/jedi-knights/holocron/broker/internal/cluster"
+	"github.com/jedi-knights/holocron/broker/internal/groups"
+	"github.com/jedi-knights/holocron/broker/internal/log"
 	"github.com/jedi-knights/holocron/broker/internal/topic"
 	"github.com/jedi-knights/holocron/proto"
 )
@@ -54,6 +56,12 @@ func fetchCompressionWorthIt(records []proto.Record) bool {
 type Server struct {
 	core *broker.Broker
 
+	// ctx is cancelled by Close so long-poll handlers (e.g. the
+	// HeartbeatWait long-poll path) unblock immediately during
+	// shutdown rather than waiting out their own deadlines.
+	ctx       context.Context
+	cancelCtx context.CancelFunc
+
 	mu       sync.Mutex
 	listener net.Listener
 	conns    map[net.Conn]struct{}
@@ -62,6 +70,100 @@ type Server struct {
 	apiKeys       map[string]struct{}
 	produceQuotas map[string]*tokenBucket // per-API-key produce limiter
 	fetchQuotas   map[string]*tokenBucket // per-API-key fetch limiter
+	acls          map[string]aclEntry     // per-API-key authorization
+}
+
+// ACL is the public-facing per-key authorization table. Produce and
+// Consume each list the topics the API key may publish to or read
+// from. A list containing the single element "*" grants the
+// permission on every topic; an empty list denies all.
+type ACL struct {
+	Produce []string
+	Consume []string
+}
+
+// aclEntry is the indexed form the server matches against on every
+// authenticated request. Topic membership uses sets for O(1)
+// look-ups; the wildcard flag short-circuits the set check.
+type aclEntry struct {
+	produceAll bool
+	consumeAll bool
+	produce    map[string]struct{}
+	consume    map[string]struct{}
+}
+
+// SetACL installs per-API-key authorization. Existing connections
+// pick up the new policy on their next request. An empty map clears
+// every restriction (default — no authorization, only authentication
+// applies).
+func (s *Server) SetACL(acls map[string]ACL) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(acls) == 0 {
+		s.acls = nil
+		return
+	}
+	s.acls = make(map[string]aclEntry, len(acls))
+	for key, entry := range acls {
+		ae := aclEntry{
+			produce: make(map[string]struct{}, len(entry.Produce)),
+			consume: make(map[string]struct{}, len(entry.Consume)),
+		}
+		for _, t := range entry.Produce {
+			if t == "*" {
+				ae.produceAll = true
+				continue
+			}
+			ae.produce[t] = struct{}{}
+		}
+		for _, t := range entry.Consume {
+			if t == "*" {
+				ae.consumeAll = true
+				continue
+			}
+			ae.consume[t] = struct{}{}
+		}
+		s.acls[key] = ae
+	}
+}
+
+// authorizeProduce returns true when apiKey may publish to topic.
+// When no ACL is configured (the default), authorization is open —
+// only authentication gates access.
+func (s *Server) authorizeProduce(apiKey, topic string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.acls == nil {
+		return true
+	}
+	entry, ok := s.acls[apiKey]
+	if !ok {
+		return false
+	}
+	if entry.produceAll {
+		return true
+	}
+	_, ok = entry.produce[topic]
+	return ok
+}
+
+// authorizeConsume returns true when apiKey may read from topic.
+// Same rules as authorizeProduce.
+func (s *Server) authorizeConsume(apiKey, topic string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.acls == nil {
+		return true
+	}
+	entry, ok := s.acls[apiKey]
+	if !ok {
+		return false
+	}
+	if entry.consumeAll {
+		return true
+	}
+	_, ok = entry.consume[topic]
+	return ok
 }
 
 // Quota configures a per-API-key bandwidth limit. Produce quotas count
@@ -152,9 +254,12 @@ func (s *Server) SetAPIKeys(keys []string) {
 
 // New returns a Server bound to the given Broker.
 func New(b *broker.Broker) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		core:  b,
-		conns: make(map[net.Conn]struct{}),
+		core:      b,
+		ctx:       ctx,
+		cancelCtx: cancel,
+		conns:     make(map[net.Conn]struct{}),
 	}
 }
 
@@ -230,7 +335,9 @@ func (s *Server) acceptLoop(ln net.Listener) {
 }
 
 // Close stops accepting new connections, closes existing ones, and waits
-// for all in-flight handlers to return.
+// for all in-flight handlers to return. Any long-poll handlers (e.g.
+// the long-poll heartbeat path) unblock immediately because s.ctx is
+// cancelled before the conns are closed.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closing {
@@ -245,6 +352,7 @@ func (s *Server) Close() error {
 	}
 	s.mu.Unlock()
 
+	s.cancelCtx()
 	if ln != nil {
 		_ = ln.Close()
 	}
@@ -346,6 +454,22 @@ func (s *Server) dispatch(op proto.OpCode, apiKey string, body []byte, w io.Writ
 		return s.handleAddVoter(body, w)
 	case proto.OpRemoveVoter:
 		return s.handleRemoveVoter(body, w)
+	case proto.OpListSegments:
+		return s.handleListSegments(body, w)
+	case proto.OpFetchSegmentChunk:
+		return s.handleFetchSegmentChunk(body, w)
+	case proto.OpDeleteTopic:
+		return s.handleDeleteTopic(body, w)
+	case proto.OpListTopics:
+		return s.handleListTopics(body, w)
+	case proto.OpListGroups:
+		return s.handleListGroups(body, w)
+	case proto.OpDescribeGroup:
+		return s.handleDescribeGroup(body, w)
+	case proto.OpClusterStatus:
+		return s.handleClusterStatus(body, w)
+	case proto.OpUpdateTopicConfig:
+		return s.handleUpdateTopicConfig(body, w)
 	case proto.OpCommit:
 		return s.handleCommit(body, w)
 	case proto.OpJoinGroup:
@@ -368,6 +492,10 @@ func (s *Server) handleProduce(apiKey string, body []byte, w io.Writer) error {
 	req, err := proto.DecodeProduceRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpProduce, proto.StatusInvalidRequest, err.Error())
+	}
+	if !s.authorizeProduce(apiKey, req.Topic) {
+		return proto.WriteErrorResponse(w, proto.OpProduce, proto.StatusForbidden,
+			fmt.Sprintf("not authorized to produce to %q", req.Topic))
 	}
 	if limiter := s.limiterFor(apiKey); limiter != nil {
 		if !limiter.take(int64(len(req.Record.Value))) {
@@ -399,6 +527,10 @@ func (s *Server) handleFetch(apiKey string, body []byte, w io.Writer) error {
 	req, err := proto.DecodeFetchRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpFetch, proto.StatusInvalidRequest, err.Error())
+	}
+	if !s.authorizeConsume(apiKey, req.Topic) {
+		return proto.WriteErrorResponse(w, proto.OpFetch, proto.StatusForbidden,
+			fmt.Sprintf("not authorized to consume from %q", req.Topic))
 	}
 	pref := proto.PartitionRef{Topic: req.Topic, Index: req.Partition}
 	deadline := time.Now().Add(time.Duration(req.MaxWaitMs) * time.Millisecond)
@@ -545,6 +677,97 @@ func (s *Server) handleCreateTopic(body []byte, w io.Writer) error {
 	return proto.WriteResponse(w, proto.OpCreateTopic, proto.StatusOK, nil)
 }
 
+func (s *Server) handleUpdateTopicConfig(body []byte, w io.Writer) error {
+	req, err := proto.DecodeUpdateTopicConfigRequest(body)
+	if err != nil {
+		return proto.WriteErrorResponse(w, proto.OpUpdateTopicConfig, proto.StatusInvalidRequest, err.Error())
+	}
+	if err := s.core.UpdateTopicConfig(req.Name, req.RetentionMs, req.SegmentBytes); err != nil {
+		return s.respondError(w, proto.OpUpdateTopicConfig, err)
+	}
+	return proto.WriteResponse(w, proto.OpUpdateTopicConfig, proto.StatusOK, nil)
+}
+
+func (s *Server) handleDeleteTopic(body []byte, w io.Writer) error {
+	req, err := proto.DecodeDeleteTopicRequest(body)
+	if err != nil {
+		return proto.WriteErrorResponse(w, proto.OpDeleteTopic, proto.StatusInvalidRequest, err.Error())
+	}
+	if err := s.core.DeleteTopic(req.Name); err != nil {
+		return s.respondError(w, proto.OpDeleteTopic, err)
+	}
+	return proto.WriteResponse(w, proto.OpDeleteTopic, proto.StatusOK, nil)
+}
+
+func (s *Server) handleListTopics(_ []byte, w io.Writer) error {
+	topics := s.core.Registry().List()
+	return proto.WriteResponse(w, proto.OpListTopics, proto.StatusOK,
+		proto.ListTopicsResponse{Topics: topics}.Encode())
+}
+
+func (s *Server) handleListGroups(_ []byte, w io.Writer) error {
+	mgr := s.core.Groups()
+	if mgr == nil {
+		return proto.WriteResponse(w, proto.OpListGroups, proto.StatusOK,
+			proto.ListGroupsResponse{}.Encode())
+	}
+	summaries := mgr.List()
+	out := make([]proto.GroupSummary, len(summaries))
+	for i, g := range summaries {
+		out[i] = proto.GroupSummary{
+			Name: g.Name, Generation: g.Generation,
+			MemberCount: g.MemberCount, Topics: g.Topics,
+		}
+	}
+	return proto.WriteResponse(w, proto.OpListGroups, proto.StatusOK,
+		proto.ListGroupsResponse{Groups: out}.Encode())
+}
+
+func (s *Server) handleClusterStatus(_ []byte, w io.Writer) error {
+	cl := s.core.Cluster()
+	if cl == nil {
+		// Non-clustered broker reports an empty status — caller
+		// surfaces that as "not part of a cluster."
+		return proto.WriteResponse(w, proto.OpClusterStatus, proto.StatusOK,
+			proto.ClusterStatusResponse{}.Encode())
+	}
+	return proto.WriteResponse(w, proto.OpClusterStatus, proto.StatusOK,
+		proto.ClusterStatusResponse{
+			NodeID:     cl.NodeID(),
+			IsLeader:   cl.IsLeader(),
+			LeaderID:   cl.LeaderID(),
+			LeaderAddr: cl.LeaderAddr(),
+		}.Encode())
+}
+
+func (s *Server) handleDescribeGroup(body []byte, w io.Writer) error {
+	req, err := proto.DecodeDescribeGroupRequest(body)
+	if err != nil {
+		return proto.WriteErrorResponse(w, proto.OpDescribeGroup, proto.StatusInvalidRequest, err.Error())
+	}
+	mgr := s.core.Groups()
+	if mgr == nil {
+		return proto.WriteErrorResponse(w, proto.OpDescribeGroup, proto.StatusUnknownMember,
+			"server has no group manager")
+	}
+	details, err := mgr.Describe(req.Group)
+	if err != nil {
+		return proto.WriteErrorResponse(w, proto.OpDescribeGroup, proto.StatusUnknownMember, err.Error())
+	}
+	members := make([]proto.MemberAssignment, len(details.Members))
+	for i, m := range details.Members {
+		members[i] = proto.MemberAssignment{
+			MemberID:   m.MemberID,
+			Partitions: append([]proto.PartitionRef(nil), m.Partitions...),
+		}
+	}
+	return proto.WriteResponse(w, proto.OpDescribeGroup, proto.StatusOK,
+		proto.DescribeGroupResponse{
+			Name: details.Name, Generation: details.Generation,
+			Topics: details.Topics, Members: members,
+		}.Encode())
+}
+
 func (s *Server) handleCommit(body []byte, w io.Writer) error {
 	req, err := proto.DecodeCommitRequest(body)
 	if err != nil {
@@ -599,7 +822,31 @@ func (s *Server) handleHeartbeat(body []byte, w io.Writer) error {
 		return proto.WriteErrorResponse(w, proto.OpHeartbeat, proto.StatusInvalidRequest,
 			"server has no group manager")
 	}
-	res, err := mgr.Heartbeat(req.Group, req.MemberID, req.Generation)
+
+	// MaxWaitMs > 0 enables the server-push long-poll: the call blocks
+	// until the group rebalances or the deadline elapses. The wait is
+	// bounded by serverHeartbeatWaitCap so a misbehaving client can't
+	// pin a goroutine indefinitely; legitimate SDKs request waits in
+	// the sub-second range.
+	wait := time.Duration(req.MaxWaitMs) * time.Millisecond
+	if wait > serverHeartbeatWaitCap {
+		wait = serverHeartbeatWaitCap
+	}
+
+	var res groups.HeartbeatResult
+	if wait > 0 {
+		res, err = mgr.HeartbeatWait(s.ctx, req.Group, req.MemberID, req.Generation, wait)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// Server is shutting down (or ctx cancelled mid-wait). Treat
+			// as a no-rebalance response so the SDK can decide whether
+			// to reconnect; the conn close that follows will surface
+			// the real failure.
+			return proto.WriteResponse(w, proto.OpHeartbeat, proto.StatusOK,
+				proto.HeartbeatResponse{}.Encode())
+		}
+	} else {
+		res, err = mgr.Heartbeat(req.Group, req.MemberID, req.Generation)
+	}
 	if err != nil {
 		// Unknown member is reported as RebalanceNeeded so the SDK rejoins.
 		return proto.WriteErrorResponse(w, proto.OpHeartbeat, proto.StatusUnknownMember, err.Error())
@@ -608,10 +855,64 @@ func (s *Server) handleHeartbeat(body []byte, w io.Writer) error {
 		proto.HeartbeatResponse{RebalanceNeeded: res.RebalanceNeeded}.Encode())
 }
 
+// serverHeartbeatWaitCap is the upper bound on how long the server
+// will hold a long-poll heartbeat. Caps client-supplied MaxWaitMs so
+// a stale or buggy SDK can't pin a goroutine for hours.
+const serverHeartbeatWaitCap = 30 * time.Second
+
+func (s *Server) handleListSegments(body []byte, w io.Writer) error {
+	req, err := proto.DecodeListSegmentsRequest(body)
+	if err != nil {
+		return proto.WriteErrorResponse(w, proto.OpListSegments, proto.StatusInvalidRequest, err.Error())
+	}
+	infos, err := s.core.ListSegments(s.ctx, proto.PartitionRef{
+		Topic: req.Topic,
+		Index: req.Partition,
+	})
+	if err != nil {
+		return s.respondError(w, proto.OpListSegments, err)
+	}
+	wireInfos := make([]proto.SegmentInfo, len(infos))
+	for i, in := range infos {
+		wireInfos[i] = proto.SegmentInfo{Base: in.Base, LogSize: in.LogSize, IdxSize: in.IdxSize}
+	}
+	return proto.WriteResponse(w, proto.OpListSegments, proto.StatusOK,
+		proto.ListSegmentsResponse{Segments: wireInfos}.Encode())
+}
+
+// segmentChunkServerCap caps the per-call payload of
+// FetchSegmentChunk so a malicious or buggy client can't ask for
+// gigabytes in one round-trip and exhaust broker memory. Legitimate
+// SDKs request chunks well below this.
+const segmentChunkServerCap = 4 << 20 // 4 MiB
+
+func (s *Server) handleFetchSegmentChunk(body []byte, w io.Writer) error {
+	req, err := proto.DecodeFetchSegmentChunkRequest(body)
+	if err != nil {
+		return proto.WriteErrorResponse(w, proto.OpFetchSegmentChunk, proto.StatusInvalidRequest, err.Error())
+	}
+	max := int(req.MaxBytes)
+	if max <= 0 || max > segmentChunkServerCap {
+		max = segmentChunkServerCap
+	}
+	bytes, err := s.core.FetchSegmentChunk(s.ctx,
+		proto.PartitionRef{Topic: req.Topic, Index: req.Partition},
+		req.Base, log.SegmentKind(req.Kind), req.Offset, max)
+	if err != nil {
+		return s.respondError(w, proto.OpFetchSegmentChunk, err)
+	}
+	return proto.WriteResponse(w, proto.OpFetchSegmentChunk, proto.StatusOK,
+		proto.FetchSegmentChunkResponse{Bytes: bytes}.Encode())
+}
+
 func (s *Server) handleProduceBatch(apiKey string, body []byte, w io.Writer) error {
 	req, err := proto.DecodeProduceBatchRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpProduceBatch, proto.StatusInvalidRequest, err.Error())
+	}
+	if !s.authorizeProduce(apiKey, req.Topic) {
+		return proto.WriteErrorResponse(w, proto.OpProduceBatch, proto.StatusForbidden,
+			fmt.Sprintf("not authorized to produce to %q", req.Topic))
 	}
 	if len(req.Records) == 0 {
 		return proto.WriteResponse(w, proto.OpProduceBatch, proto.StatusOK,

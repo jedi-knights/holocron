@@ -3,6 +3,7 @@ package registry_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,6 +179,160 @@ func TestStartReplaysExistingTopic(t *testing.T) {
 	}
 }
 
+// TestSetCompatibility_PersistsAndEnforcesOnRegister proves the
+// per-subject compatibility config is stored, recovered after
+// restart, and applied automatically by Register — a schema that
+// would violate the configured mode is rejected at registration
+// time without needing an explicit CheckCompatibility call.
+func TestSetCompatibility_PersistsAndEnforcesOnRegister(t *testing.T) {
+	// Arrange — register a baseline, then turn on BACKWARD.
+	svc, b := newServiceForTest(t)
+	ctx := context.Background()
+	if _, err := svc.Register(ctx, "u", `{"required":["id"]}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetCompatibility(ctx, "u", registry.CompatibilityBackward); err != nil {
+		t.Fatalf("SetCompatibility: %v", err)
+	}
+
+	// Act + Assert — adding a required field violates BACKWARD.
+	if _, err := svc.Register(ctx, "u", `{"required":["id","email"]}`); err == nil {
+		t.Errorf("Register with BACKWARD-violating schema succeeded; expected rejection")
+	}
+	// Relaxing the requirements is fine.
+	if _, err := svc.Register(ctx, "u", `{"required":["id"]}`); err != nil {
+		t.Errorf("Register of identical schema (idempotent): %v", err)
+	}
+
+	// Restart — config must replay.
+	_ = svc.Close()
+	svc2, err := registry.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc2.Close()
+	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc2.Start(startCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc2.GetCompatibility("u"); got != registry.CompatibilityBackward {
+		t.Errorf("after restart: got %q, want BACKWARD", got)
+	}
+}
+
+// TestSetCompatibility_NoneClearsTheMode proves resetting the
+// mode to NONE removes the per-subject entry, matching the
+// "unset" default.
+func TestSetCompatibility_NoneClearsTheMode(t *testing.T) {
+	svc, _ := newServiceForTest(t)
+	ctx := context.Background()
+	if _, err := svc.Register(ctx, "x", `{"required":["a"]}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetCompatibility(ctx, "x", registry.CompatibilityFull); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.GetCompatibility("x"); got != registry.CompatibilityFull {
+		t.Fatalf("after SetCompatibility(FULL): got %q", got)
+	}
+	if err := svc.SetCompatibility(ctx, "x", registry.CompatibilityNone); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.GetCompatibility("x"); got != registry.CompatibilityNone {
+		t.Errorf("after SetCompatibility(NONE): got %q, want NONE", got)
+	}
+}
+
+// TestCheckCompatibility_BackwardPasses proves the structural
+// BACKWARD check accepts a candidate schema whose required field
+// set is a subset of the existing latest schema's required set —
+// records valid under old still satisfy new.
+func TestCheckCompatibility_BackwardPasses(t *testing.T) {
+	// Arrange — existing schema requires id and name.
+	svc, _ := newServiceForTest(t)
+	if _, err := svc.Register(context.Background(), "u",
+		`{"required":["id","name"]}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act — candidate drops "name" (relaxes the contract).
+	ok, err := svc.CheckCompatibility("u", `{"required":["id"]}`, registry.CompatibilityBackward)
+
+	// Assert
+	if err != nil {
+		t.Fatalf("CheckCompatibility: %v", err)
+	}
+	if !ok {
+		t.Errorf("expected BACKWARD-compatible (relaxing required fields)")
+	}
+}
+
+// TestCheckCompatibility_BackwardRejectsAddedRequired proves the
+// check catches the canonical mistake — adding a previously-
+// optional field to the required set, breaking records produced
+// under the old schema.
+func TestCheckCompatibility_BackwardRejectsAddedRequired(t *testing.T) {
+	// Arrange
+	svc, _ := newServiceForTest(t)
+	if _, err := svc.Register(context.Background(), "u",
+		`{"required":["id"]}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act — candidate adds a new required field.
+	ok, err := svc.CheckCompatibility("u",
+		`{"required":["id","email"]}`, registry.CompatibilityBackward)
+
+	// Assert
+	if ok {
+		t.Errorf("expected BACKWARD-incompatible (added required field)")
+	}
+	if err == nil || !strings.Contains(err.Error(), "email") {
+		t.Errorf("expected error mentioning the offending field, got %v", err)
+	}
+}
+
+// TestCheckCompatibility_FullRequiresExactMatch proves FULL mode
+// rejects either direction's violation. Adding a required field
+// breaks BACKWARD; dropping one breaks FORWARD; only an exact
+// match passes.
+func TestCheckCompatibility_FullRequiresExactMatch(t *testing.T) {
+	// Arrange
+	svc, _ := newServiceForTest(t)
+	if _, err := svc.Register(context.Background(), "u",
+		`{"required":["id","name"]}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act + Assert — adding a field violates FULL.
+	if ok, _ := svc.CheckCompatibility("u",
+		`{"required":["id","name","email"]}`, registry.CompatibilityFull); ok {
+		t.Errorf("FULL should reject adding required field")
+	}
+	// Dropping a field violates FULL.
+	if ok, _ := svc.CheckCompatibility("u",
+		`{"required":["id"]}`, registry.CompatibilityFull); ok {
+		t.Errorf("FULL should reject dropping required field")
+	}
+	// Exact match passes.
+	if ok, err := svc.CheckCompatibility("u",
+		`{"required":["id","name"]}`, registry.CompatibilityFull); !ok || err != nil {
+		t.Errorf("FULL exact match: ok=%v err=%v, want ok=true err=nil", ok, err)
+	}
+}
+
+// TestCheckCompatibility_NoneAlwaysPasses proves the NONE mode
+// short-circuits without parsing — an unparseable schema doesn't
+// surface as an error when compatibility is disabled.
+func TestCheckCompatibility_NoneAlwaysPasses(t *testing.T) {
+	svc, _ := newServiceForTest(t)
+	ok, err := svc.CheckCompatibility("anything", `not even json`, registry.CompatibilityNone)
+	if !ok || err != nil {
+		t.Errorf("NONE: ok=%v err=%v, want ok=true err=nil", ok, err)
+	}
+}
+
 // TestDeleteSubject_RemovesFromAllReadPaths proves DeleteSubject takes
 // the subject out of GetLatest, GetVersion, ListSubjects, and
 // ListVersions immediately.
@@ -213,6 +368,126 @@ func TestDeleteSubject_RemovesFromAllReadPaths(t *testing.T) {
 	// Sibling subject untouched.
 	if _, err := svc.GetLatest("kept"); err != nil {
 		t.Errorf("kept subject should still be present: %v", err)
+	}
+}
+
+// TestDeleteByID_RemovesAddressedSchemaOnly proves DeleteByID
+// resolves the ID to its (subject, version) and removes only that
+// version. Sibling versions of the same subject and other
+// subjects are untouched.
+func TestDeleteByID_RemovesAddressedSchemaOnly(t *testing.T) {
+	// Arrange
+	svc, _ := newServiceForTest(t)
+	ctx := context.Background()
+	id1, _ := svc.Register(ctx, "events", `{"v":1}`)
+	id2, _ := svc.Register(ctx, "events", `{"v":2}`)
+	_, _ = svc.Register(ctx, "other", `{"v":1}`)
+
+	// Act — delete the middle ID.
+	_ = id1
+	if err := svc.DeleteByID(ctx, id2); err != nil {
+		t.Fatalf("DeleteByID: %v", err)
+	}
+
+	// Assert — id2 is gone; id1 still resolves; "other" is untouched.
+	if _, err := svc.GetByID(id2); !errors.Is(err, registry.ErrSchemaNotFound) {
+		t.Errorf("GetByID(deleted): got %v, want ErrSchemaNotFound", err)
+	}
+	if _, err := svc.GetByID(id1); err != nil {
+		t.Errorf("GetByID(sibling): %v", err)
+	}
+	if _, err := svc.GetLatest("other"); err != nil {
+		t.Errorf("other subject lost: %v", err)
+	}
+}
+
+// TestDeleteByID_MissingReturnsSentinel proves DeleteByID surfaces
+// ErrSchemaNotFound rather than silently succeeding for an
+// unregistered ID.
+func TestDeleteByID_MissingReturnsSentinel(t *testing.T) {
+	svc, _ := newServiceForTest(t)
+	err := svc.DeleteByID(context.Background(), 99999)
+	if !errors.Is(err, registry.ErrSchemaNotFound) {
+		t.Fatalf("got %v, want ErrSchemaNotFound", err)
+	}
+}
+
+// TestDeleteVersion_RemovesOnlyThatVersion proves a per-version
+// delete leaves the rest of the subject's history intact. Other
+// versions still resolve via GetVersion; ListVersions surfaces a
+// gap (Confluent semantic).
+func TestDeleteVersion_RemovesOnlyThatVersion(t *testing.T) {
+	// Arrange
+	svc, _ := newServiceForTest(t)
+	ctx := context.Background()
+	for _, schema := range []string{`{"v":1}`, `{"v":2}`, `{"v":3}`} {
+		if _, err := svc.Register(ctx, "events", schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Act — delete version 2.
+	if err := svc.DeleteVersion(ctx, "events", 2); err != nil {
+		t.Fatalf("DeleteVersion: %v", err)
+	}
+
+	// Assert
+	if _, err := svc.GetVersion("events", 2); !errors.Is(err, registry.ErrVersionNotFound) {
+		t.Errorf("GetVersion(events, 2): got %v, want ErrVersionNotFound", err)
+	}
+	// Versions 1 and 3 still present.
+	if _, err := svc.GetVersion("events", 1); err != nil {
+		t.Errorf("GetVersion(events, 1) after delete-version-2: %v", err)
+	}
+	if _, err := svc.GetVersion("events", 3); err != nil {
+		t.Errorf("GetVersion(events, 3) after delete-version-2: %v", err)
+	}
+	// ListVersions surfaces the gap.
+	versions, err := svc.ListVersions("events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 2 || versions[0] != 1 || versions[1] != 3 {
+		t.Errorf("ListVersions: got %v, want [1 3]", versions)
+	}
+}
+
+// TestDeleteVersion_SurvivesRestart proves the per-version delete
+// marker is durable on the schemas topic and a fresh Service
+// replaying the topic converges to the same gapped sequence.
+func TestDeleteVersion_SurvivesRestart(t *testing.T) {
+	// Arrange
+	svc, b := newServiceForTest(t)
+	ctx := context.Background()
+	for _, schema := range []string{`{"v":1}`, `{"v":2}`, `{"v":3}`} {
+		if _, err := svc.Register(ctx, "events", schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := svc.DeleteVersion(ctx, "events", 2); err != nil {
+		t.Fatal(err)
+	}
+	_ = svc.Close()
+
+	// Act — fresh Service over the same broker.
+	svc2, err := registry.New(b.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc2.Close()
+	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc2.Start(startCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert — replay observes the delete.
+	if _, err := svc2.GetVersion("events", 2); !errors.Is(err, registry.ErrVersionNotFound) {
+		t.Errorf("after restart, deleted version reappeared: %v", err)
+	}
+	versions, _ := svc2.ListVersions("events")
+	if len(versions) != 2 || versions[0] != 1 || versions[1] != 3 {
+		t.Errorf("after restart, ListVersions: got %v, want [1 3]", versions)
 	}
 }
 
@@ -439,9 +714,12 @@ func TestCheckCompatibility_NoneAlwaysAccepts(t *testing.T) {
 	}
 }
 
-func TestCheckCompatibility_BackwardNotImplemented(t *testing.T) {
+// TestCheckCompatibility_RejectsUnknownMode proves the check
+// surfaces an explicit error for a typo'd or unknown mode rather
+// than silently passing.
+func TestCheckCompatibility_RejectsUnknownMode(t *testing.T) {
 	svc, _ := newServiceForTest(t)
-	if _, err := svc.CheckCompatibility("any", "any", registry.CompatibilityBackward); err == nil {
-		t.Fatal("expected error for unimplemented BACKWARD")
+	if _, err := svc.CheckCompatibility("any", "{}", "QUESTIONABLE"); err == nil {
+		t.Fatal("expected error for unknown compatibility mode")
 	}
 }

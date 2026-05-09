@@ -187,6 +187,11 @@ func (c *Cluster) IsLeader() bool {
 	return c.raft.State() == raft.Leader
 }
 
+// NodeID returns this node's Raft ID — the value passed in at
+// construction. Useful for status reporting so an operator can see
+// which broker they're talking to alongside the leader's identity.
+func (c *Cluster) NodeID() string { return c.cfg.NodeID }
+
 // LeaderAddr returns the Raft address of the current cluster leader, or
 // "" if no leader is known. Use LeaderWireAddr for the broker port.
 func (c *Cluster) LeaderAddr() string {

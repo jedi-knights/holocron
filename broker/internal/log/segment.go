@@ -68,6 +68,17 @@ func segmentIndexName(baseOffset int64) string {
 	return fmt.Sprintf("%0*d.idx", segmentNameWidth, baseOffset)
 }
 
+// SegmentFileName returns the canonical filename for the addressed
+// segment component. Exported so the data-dir bootstrap can write
+// chunks to the correct local path without relying on string
+// formatting it has to keep in sync with segment.go.
+func SegmentFileName(base int64, kind SegmentKind) string {
+	if kind == SegmentIdx {
+		return segmentIndexName(base)
+	}
+	return segmentLogName(base)
+}
+
 // parseBaseOffset extracts the base offset encoded in a segment filename
 // like "00000000000000000123.log".
 func parseBaseOffset(name string) (int64, error) {
@@ -254,6 +265,21 @@ func (s *segment) flushIfActive() error {
 		return nil
 	}
 	return s.logBuf.Flush()
+}
+
+// snapshotSync flushes the segment's log buffer, fsyncs the .log
+// file, and writes the in-memory index to disk so file sizes
+// reported in a Snapshot match what a downstream reader can actually
+// read. Idempotent — calling it on an already-sealed segment is a
+// no-op for the buffer flush and harmlessly rewrites the .idx.
+func (s *segment) snapshotSync() error {
+	if err := s.flushIfActive(); err != nil {
+		return err
+	}
+	if err := s.logFile.Sync(); err != nil {
+		return err
+	}
+	return s.persistIndex()
 }
 
 // shouldRoll reports whether the segment has reached its size cap and

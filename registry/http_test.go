@@ -3,6 +3,8 @@ package registry_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -146,6 +148,155 @@ func TestHTTP_DeleteSubject(t *testing.T) {
 	}
 	if subjects := svc.ListSubjects(); len(subjects) != 0 {
 		t.Errorf("subject still present after DELETE: %v", subjects)
+	}
+}
+
+// TestHTTP_ConfigEndpoints proves PUT /config/{subject} persists
+// a compatibility mode and GET /config/{subject} reads it back.
+// Default for unset subjects is "NONE".
+func TestHTTP_ConfigEndpoints(t *testing.T) {
+	srv, _ := newHTTPHandler(t)
+
+	// Default = NONE.
+	resp, err := http.Get(srv.URL + "/config/anything")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body map[string]string
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if body["compatibilityLevel"] != "NONE" {
+		t.Errorf("default: got %q, want NONE", body["compatibilityLevel"])
+	}
+
+	// PUT BACKWARD.
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/config/u",
+		strings.NewReader(`{"compatibility":"BACKWARD"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status: got %d, want 200", resp2.StatusCode)
+	}
+
+	// GET reads the new value.
+	resp3, err := http.Get(srv.URL + "/config/u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp3.Body.Close()
+	body = nil
+	_ = json.NewDecoder(resp3.Body).Decode(&body)
+	if body["compatibilityLevel"] != "BACKWARD" {
+		t.Errorf("after PUT: got %q, want BACKWARD", body["compatibilityLevel"])
+	}
+}
+
+// TestHTTP_SchemaOnlyEndpoints proves the Confluent-compat
+// /subjects/{s}/versions/{v}/schema and /schemas/ids/{id}/schema
+// endpoints return the bare schema text — no JSON wrapper.
+func TestHTTP_SchemaOnlyEndpoints(t *testing.T) {
+	// Arrange
+	srv, svc := newHTTPHandler(t)
+	id, err := svc.Register(context.Background(), "events", `{"required":["id"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []string{
+		fmt.Sprintf("%s/subjects/events/versions/1/schema", srv.URL),
+		fmt.Sprintf("%s/subjects/events/versions/latest/schema", srv.URL),
+		fmt.Sprintf("%s/schemas/ids/%d/schema", srv.URL, id),
+	}
+	for _, url := range cases {
+		t.Run(url, func(t *testing.T) {
+			resp, err := http.Get(url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status: got %d, want 200", resp.StatusCode)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			if string(body) != `{"required":["id"]}` {
+				t.Errorf("body: got %q, want bare schema text", body)
+			}
+		})
+	}
+}
+
+// TestHTTP_DeleteByID proves DELETE /schemas/ids/{id} drops the
+// addressed schema. Subsequent GET /schemas/ids/{id} returns 404;
+// sibling schemas under the same subject still resolve.
+func TestHTTP_DeleteByID(t *testing.T) {
+	// Arrange
+	srv, svc := newHTTPHandler(t)
+	ctx := context.Background()
+	id1, _ := svc.Register(ctx, "events", `{"v":1}`)
+	id2, _ := svc.Register(ctx, "events", `{"v":2}`)
+
+	req, _ := http.NewRequest(http.MethodDelete,
+		fmt.Sprintf("%s/schemas/ids/%d", srv.URL, id2), nil)
+
+	// Act
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Assert
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE status: got %d, want 200", resp.StatusCode)
+	}
+	if got, _ := http.Get(fmt.Sprintf("%s/schemas/ids/%d", srv.URL, id2)); got.StatusCode != http.StatusNotFound {
+		t.Errorf("GET deleted ID: got %d, want 404", got.StatusCode)
+	}
+	if got, _ := http.Get(fmt.Sprintf("%s/schemas/ids/%d", srv.URL, id1)); got.StatusCode != http.StatusOK {
+		t.Errorf("GET sibling ID: got %d, want 200", got.StatusCode)
+	}
+}
+
+// TestHTTP_DeleteVersion proves the DELETE /subjects/{s}/versions/{v}
+// route removes a single version while leaving the rest of the
+// subject's history intact. Re-fetching the deleted version returns
+// 404; siblings still resolve.
+func TestHTTP_DeleteVersion(t *testing.T) {
+	// Arrange
+	srv, svc := newHTTPHandler(t)
+	for _, schema := range []string{`{"v":1}`, `{"v":2}`, `{"v":3}`} {
+		if _, err := svc.Register(context.Background(), "events", schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/subjects/events/versions/2", nil)
+
+	// Act
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Assert — DELETE succeeds with 200.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE status: got %d, want 200", resp.StatusCode)
+	}
+
+	// Version 2 now 404s; versions 1 and 3 still resolve.
+	if got, _ := http.Get(srv.URL + "/subjects/events/versions/2"); got.StatusCode != http.StatusNotFound {
+		t.Errorf("GET deleted version: got %d, want 404", got.StatusCode)
+	}
+	if got, _ := http.Get(srv.URL + "/subjects/events/versions/1"); got.StatusCode != http.StatusOK {
+		t.Errorf("GET version 1: got %d, want 200", got.StatusCode)
+	}
+	if got, _ := http.Get(srv.URL + "/subjects/events/versions/3"); got.StatusCode != http.StatusOK {
+		t.Errorf("GET version 3: got %d, want 200", got.StatusCode)
 	}
 }
 

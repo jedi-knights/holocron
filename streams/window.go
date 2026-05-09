@@ -39,68 +39,18 @@ func (g *GroupedStream) TumblingCount(windowSize time.Duration, storeName string
 	store := g.stream.topology.Store(storeName)
 	windowNanos := windowSize.Nanoseconds()
 
-	// Punctuator: emits closed windows on a tick, advancing watermark
-	// to wall-clock time so windows close even when records aren't
-	// flowing. Registered with the topology; only fires when
-	// WithPunctuationInterval is set.
-	closeFn := func(currentStart int64, watermark int64) []proto.Record {
-		var out []proto.Record
-		store.Range(func(k, v []byte) bool {
-			origKey, windowStart, ok := parseWindowKey(k)
-			if !ok {
-				return true
-			}
-			windowEnd := windowStart + windowNanos
-			if windowEnd <= watermark && windowStart != currentStart {
-				vc := make([]byte, len(v))
-				copy(vc, v)
-				out = append(out, proto.Record{
-					Key:   append([]byte(nil), origKey...),
-					Value: vc,
-					Headers: []proto.Header{
-						{Key: HeaderWindowStart, Value: encodeInt64(windowStart)},
-						{Key: HeaderWindowEnd, Value: encodeInt64(windowStart + windowNanos)},
-					},
-				})
-			}
-			return true
-		})
-		for _, r := range out {
-			windowStart := DecodeWindowTime(headerValue(r.Headers, HeaderWindowStart))
-			store.Delete(makeWindowKey(r.Key, windowStart))
-		}
-		return out
-	}
-	punctuator := func(now int64) []proto.Record {
-		// Advance watermark to wall-clock time (acts as a backstop
-		// when no records are flowing). Then emit anything closed.
-		wm := g.stream.topology.advanceWatermark(now)
-		return closeFn(-1, wm)
-	}
-
-	return g.stream.withPunctuator(punctuator).appendOp(func(r proto.Record, t *Topology) []proto.Record {
-		// Use event-time (from Record.Timestamp by default) so windows
-		// reflect when the event happened, not when the broker saw it.
-		eventTime := t.eventTime(r)
-		currentStart := (eventTime / windowNanos) * windowNanos
-
-		// Increment the count for this record's (key, currentWindow).
-		stateKey := makeWindowKey(r.Key, currentStart)
-		cur, _ := store.Get(stateKey)
-		next := DecodeCount(cur) + 1
-		store.Put(stateKey, EncodeCount(next))
-
-		// Find closed windows — those whose end time is at or below the
-		// watermark (the highest event-time the topology has observed).
-		// Lazy close: triggers on each record arrival.
-		watermark := t.Watermark()
+	// closeOnePartition harvests every closed window from sub, deletes
+	// them, and returns the corresponding output records. Used by both
+	// the per-record path (just one partition) and the punctuator path
+	// (every partition seen so far).
+	closeOnePartition := func(sub StateStore, currentStart, watermark int64) []proto.Record {
 		type closedEntry struct {
 			origKey     []byte
 			windowStart int64
 			value       []byte
 		}
 		var closed []closedEntry
-		store.Range(func(k, v []byte) bool {
+		sub.Range(func(k, v []byte) bool {
 			origKey, windowStart, ok := parseWindowKey(k)
 			if !ok {
 				return true
@@ -117,10 +67,9 @@ func (g *GroupedStream) TumblingCount(windowSize time.Duration, storeName string
 			}
 			return true
 		})
-
 		out := make([]proto.Record, 0, len(closed))
 		for _, c := range closed {
-			store.Delete(makeWindowKey(c.origKey, c.windowStart))
+			sub.Delete(makeWindowKey(c.origKey, c.windowStart))
 			out = append(out, proto.Record{
 				Key:   c.origKey,
 				Value: c.value,
@@ -131,6 +80,38 @@ func (g *GroupedStream) TumblingCount(windowSize time.Duration, storeName string
 			})
 		}
 		return out
+	}
+
+	// Punctuator emits closed windows on a tick across every partition
+	// that's been touched. Advances watermark to wall-clock time as a
+	// backstop when no records are flowing.
+	punctuator := func(now int64) []proto.Record {
+		wm := g.stream.topology.advanceWatermark(now)
+		var out []proto.Record
+		for _, p := range store.Partitions() {
+			out = append(out, closeOnePartition(store.For(p), -1, wm)...)
+		}
+		return out
+	}
+
+	return g.stream.withPunctuator(punctuator).appendOp(func(r proto.Record, t *Topology, partition int) []proto.Record {
+		sub := store.For(partition)
+
+		// Use event-time (from Record.Timestamp by default) so windows
+		// reflect when the event happened, not when the broker saw it.
+		eventTime := t.eventTime(r)
+		currentStart := (eventTime / windowNanos) * windowNanos
+
+		// Increment the count for this record's (key, currentWindow).
+		stateKey := makeWindowKey(r.Key, currentStart)
+		cur, _ := sub.Get(stateKey)
+		next := DecodeCount(cur) + 1
+		sub.Put(stateKey, EncodeCount(next))
+
+		// Lazy close — only sweep this partition's own substore. A
+		// closed window in another partition will be flushed by that
+		// partition's next record or by the punctuator.
+		return closeOnePartition(sub, currentStart, t.Watermark())
 	})
 }
 
@@ -153,10 +134,14 @@ func (g *GroupedStream) HoppingCount(size, advance time.Duration, storeName stri
 	sizeNanos := size.Nanoseconds()
 	advanceNanos := advance.Nanoseconds()
 
-	// closeFn emits all windows whose end ≤ watermark, then deletes them.
-	closeFn := func(currentStart int64, watermark int64) []proto.Record {
-		var out []proto.Record
-		store.Range(func(k, v []byte) bool {
+	closeOnePartition := func(sub StateStore, currentStart, watermark int64) []proto.Record {
+		type closedEntry struct {
+			origKey     []byte
+			windowStart int64
+			value       []byte
+		}
+		var closed []closedEntry
+		sub.Range(func(k, v []byte) bool {
 			origKey, windowStart, ok := parseWindowKey(k)
 			if !ok {
 				return true
@@ -165,29 +150,40 @@ func (g *GroupedStream) HoppingCount(size, advance time.Duration, storeName stri
 			if windowEnd <= watermark && windowStart != currentStart {
 				vc := make([]byte, len(v))
 				copy(vc, v)
-				out = append(out, proto.Record{
-					Key:   append([]byte(nil), origKey...),
-					Value: vc,
-					Headers: []proto.Header{
-						{Key: HeaderWindowStart, Value: encodeInt64(windowStart)},
-						{Key: HeaderWindowEnd, Value: encodeInt64(windowEnd)},
-					},
+				closed = append(closed, closedEntry{
+					origKey:     append([]byte(nil), origKey...),
+					windowStart: windowStart,
+					value:       vc,
 				})
 			}
 			return true
 		})
-		for _, r := range out {
-			windowStart := DecodeWindowTime(headerValue(r.Headers, HeaderWindowStart))
-			store.Delete(makeWindowKey(r.Key, windowStart))
+		out := make([]proto.Record, 0, len(closed))
+		for _, c := range closed {
+			sub.Delete(makeWindowKey(c.origKey, c.windowStart))
+			out = append(out, proto.Record{
+				Key:   c.origKey,
+				Value: c.value,
+				Headers: []proto.Header{
+					{Key: HeaderWindowStart, Value: encodeInt64(c.windowStart)},
+					{Key: HeaderWindowEnd, Value: encodeInt64(c.windowStart + sizeNanos)},
+				},
+			})
 		}
 		return out
 	}
+
 	punctuator := func(now int64) []proto.Record {
 		wm := g.stream.topology.advanceWatermark(now)
-		return closeFn(-1, wm)
+		var out []proto.Record
+		for _, p := range store.Partitions() {
+			out = append(out, closeOnePartition(store.For(p), -1, wm)...)
+		}
+		return out
 	}
 
-	return g.stream.withPunctuator(punctuator).appendOp(func(r proto.Record, t *Topology) []proto.Record {
+	return g.stream.withPunctuator(punctuator).appendOp(func(r proto.Record, t *Topology, partition int) []proto.Record {
+		sub := store.For(partition)
 		eventTime := t.eventTime(r)
 
 		// Enumerate every (k * advance) window-start that covers
@@ -196,14 +192,12 @@ func (g *GroupedStream) HoppingCount(size, advance time.Duration, storeName stri
 		lastStart := (eventTime / advanceNanos) * advanceNanos
 		for ws := lastStart; ws > eventTime-sizeNanos && ws >= 0; ws -= advanceNanos {
 			stateKey := makeWindowKey(r.Key, ws)
-			cur, _ := store.Get(stateKey)
+			cur, _ := sub.Get(stateKey)
 			next := DecodeCount(cur) + 1
-			store.Put(stateKey, EncodeCount(next))
+			sub.Put(stateKey, EncodeCount(next))
 		}
 
-		// Lazy close — drive emission off record arrivals too.
-		watermark := t.Watermark()
-		return closeFn(lastStart, watermark)
+		return closeOnePartition(sub, lastStart, t.Watermark())
 	})
 }
 
@@ -221,47 +215,66 @@ func (g *GroupedStream) SessionCount(gap time.Duration, storeName string) *Strea
 	store := g.stream.topology.Store(storeName)
 	gapNanos := gap.Nanoseconds()
 
-	closeFn := func(watermark int64) []proto.Record {
-		var out []proto.Record
-		store.Range(func(k, v []byte) bool {
+	closeOnePartition := func(sub StateStore, watermark int64) []proto.Record {
+		type closedEntry struct {
+			key   []byte
+			start int64
+			end   int64
+			count uint64
+		}
+		var closed []closedEntry
+		sub.Range(func(k, v []byte) bool {
 			start, end, count, ok := decodeSessionState(v)
 			if !ok {
 				return true
 			}
 			if end+gapNanos <= watermark {
-				out = append(out, proto.Record{
-					Key:   append([]byte(nil), k...),
-					Value: EncodeCount(count),
-					Headers: []proto.Header{
-						{Key: HeaderWindowStart, Value: encodeInt64(start)},
-						{Key: HeaderWindowEnd, Value: encodeInt64(end)},
-					},
+				closed = append(closed, closedEntry{
+					key:   append([]byte(nil), k...),
+					start: start,
+					end:   end,
+					count: count,
 				})
 			}
 			return true
 		})
-		for _, r := range out {
-			store.Delete(r.Key)
+		out := make([]proto.Record, 0, len(closed))
+		for _, c := range closed {
+			sub.Delete(c.key)
+			out = append(out, proto.Record{
+				Key:   c.key,
+				Value: EncodeCount(c.count),
+				Headers: []proto.Header{
+					{Key: HeaderWindowStart, Value: encodeInt64(c.start)},
+					{Key: HeaderWindowEnd, Value: encodeInt64(c.end)},
+				},
+			})
 		}
 		return out
 	}
+
 	punctuator := func(now int64) []proto.Record {
 		wm := g.stream.topology.advanceWatermark(now)
-		return closeFn(wm)
+		var out []proto.Record
+		for _, p := range store.Partitions() {
+			out = append(out, closeOnePartition(store.For(p), wm)...)
+		}
+		return out
 	}
 
-	return g.stream.withPunctuator(punctuator).appendOp(func(r proto.Record, t *Topology) []proto.Record {
+	return g.stream.withPunctuator(punctuator).appendOp(func(r proto.Record, t *Topology, partition int) []proto.Record {
+		sub := store.For(partition)
 		eventTime := t.eventTime(r)
 
-		cur, ok := store.Get(r.Key)
+		cur, ok := sub.Get(r.Key)
 		if !ok {
 			// First record for key: open a new session of size 1.
-			store.Put(r.Key, encodeSessionState(eventTime, eventTime, 1))
+			sub.Put(r.Key, encodeSessionState(eventTime, eventTime, 1))
 			return nil
 		}
 		start, end, count, ok := decodeSessionState(cur)
 		if !ok {
-			store.Put(r.Key, encodeSessionState(eventTime, eventTime, 1))
+			sub.Put(r.Key, encodeSessionState(eventTime, eventTime, 1))
 			return nil
 		}
 		if eventTime > end+gapNanos {
@@ -274,12 +287,12 @@ func (g *GroupedStream) SessionCount(gap time.Duration, storeName string) *Strea
 					{Key: HeaderWindowEnd, Value: encodeInt64(end)},
 				},
 			}
-			store.Put(r.Key, encodeSessionState(eventTime, eventTime, 1))
+			sub.Put(r.Key, encodeSessionState(eventTime, eventTime, 1))
 			return []proto.Record{closed}
 		}
 		// Extend the open session.
 		newEnd := max(end, eventTime)
-		store.Put(r.Key, encodeSessionState(start, newEnd, count+1))
+		sub.Put(r.Key, encodeSessionState(start, newEnd, count+1))
 		return nil
 	})
 }
@@ -335,12 +348,3 @@ func DecodeWindowTime(b []byte) int64 {
 	return int64(binary.BigEndian.Uint64(b))
 }
 
-// headerValue returns the value of the first header matching key, or nil.
-func headerValue(headers []proto.Header, key string) []byte {
-	for _, h := range headers {
-		if h.Key == key {
-			return h.Value
-		}
-	}
-	return nil
-}

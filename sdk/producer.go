@@ -2,13 +2,72 @@ package sdk
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jedi-knights/holocron/proto"
 )
+
+// newProducerID returns a hex-encoded 16-byte random identifier.
+// Each Producer instance gets its own ID so the broker can dedup
+// retries from the same instance without confusing them with
+// concurrent producers.
+func newProducerID() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
+}
+
+// RewindIdempotencySequence rolls the producer's per-partition
+// sequence counter back by one so the next Send to that partition
+// reuses the most recently stamped sequence number. Useful for
+// tests that simulate a retry of an already-applied write; in
+// production, the broker's dedup logic catches genuine retries
+// because the SDK's transport-level retry path keeps the same
+// stamped record across attempts.
+//
+// No-op when the Producer was constructed without WithIdempotency.
+func (p *Producer) RewindIdempotencySequence(pref proto.PartitionRef) {
+	if !p.idempotent {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if seq, ok := p.idempSeqs[pref]; ok && seq > 0 {
+		p.idempSeqs[pref] = seq - 1
+	}
+}
+
+// stampIdempotencyHeaders returns r with HeaderProducerID and
+// HeaderProducerSeq appended to its Headers. Caller is the Send
+// path, holding the lock that protects idempSeqs.
+func (p *Producer) stampIdempotencyHeaders(pref proto.PartitionRef, r proto.Record) proto.Record {
+	seq := p.idempSeqs[pref]
+	p.idempSeqs[pref] = seq + 1
+	var seqBytes [8]byte
+	binary.BigEndian.PutUint64(seqBytes[:], seq)
+	out := proto.Record{
+		Offset:    r.Offset,
+		Timestamp: r.Timestamp,
+		Key:       r.Key,
+		Value:     r.Value,
+		Headers:   make([]proto.Header, 0, len(r.Headers)+2),
+	}
+	out.Headers = append(out.Headers, r.Headers...)
+	out.Headers = append(out.Headers,
+		proto.Header{Key: proto.HeaderProducerID, Value: []byte(p.producerID)},
+		proto.Header{Key: proto.HeaderProducerSeq, Value: seqBytes[:]},
+	)
+	return out
+}
 
 // Acks names the durability level a producer waits for before Send returns.
 // AcksLocal (the default) returns once the broker has accepted the record
@@ -51,11 +110,21 @@ type Producer struct {
 	codec         proto.Codec
 	rateLimitTries int           // 0 disables retry; 1+ retries per Send
 	rateLimitWait  time.Duration // base wait between retry attempts
+	idempotent     bool          // producer stamps records for broker dedup
+	producerID     string        // unique to this Producer instance
+	onSent         []SentHook    // fired after each successful Send / SendBatch
 
 	mu     sync.Mutex
 	closed bool
 	// Per-partition batchers. Allocated on first Send to that partition.
 	batchers map[proto.PartitionRef]*batcher
+	// idempSeqs tracks the next sequence number to stamp per
+	// partition. Only used when idempotent is true.
+	idempSeqs map[proto.PartitionRef]uint64
+	// asyncErrors counts flush failures for SendNoWait records —
+	// errors that didn't surface to a synchronous caller. Operators
+	// poll AsyncErrors() to detect a misbehaving producer.
+	asyncErrors atomic.Int64
 }
 
 // ProducerOption configures a Producer.
@@ -123,6 +192,41 @@ func WithRateLimitRetry(tries int, wait time.Duration) ProducerOption {
 	}
 }
 
+// SentHook is invoked after every successful Send / SendBatch
+// with the partition the record landed on and its broker-assigned
+// offset. Used for instrumentation, audit logs, and downstream
+// offset tracking without wrapping the Producer entirely.
+//
+// SendNoWait deliberately skips the hook — the caller opted out
+// of per-record observability when they chose fire-and-forget.
+type SentHook func(p proto.PartitionRef, offset int64)
+
+// WithOnSent registers a callback invoked after every successful
+// Send / SendBatch. Multiple WithOnSent calls chain — each hook
+// fires in registration order. Hooks must be cheap (run on the
+// hot publish path) and must not block.
+func WithOnSent(fn SentHook) ProducerOption {
+	return func(pr *Producer) {
+		pr.onSent = append(pr.onSent, fn)
+	}
+}
+
+// WithIdempotency enables producer-side idempotent retry. The
+// Producer assigns a unique per-instance ID and a monotonic
+// per-partition sequence number to every record it sends; the
+// broker uses the (producer-id, sequence) pair to recognize
+// retries of an already-applied write and return the original
+// offset without duplicating the record.
+//
+// Pair with WithRateLimitRetry (or any other retry strategy on top
+// of Send) to get exactly-once semantics on the produce path. The
+// broker's dedup state is in-memory only — a broker restart resets
+// the window, so retries that survive a restart can still
+// duplicate. Persistent dedup is a follow-on.
+func WithIdempotency() ProducerOption {
+	return func(pr *Producer) { pr.idempotent = true }
+}
+
 // NewProducer constructs a Producer bound to the given Transport.
 func NewProducer(t Transport, opts ...ProducerOption) (*Producer, error) {
 	if t == nil {
@@ -134,9 +238,17 @@ func NewProducer(t Transport, opts ...ProducerOption) (*Producer, error) {
 		linger:      defaultLinger,
 		batchSize:   defaultBatchSize,
 		batchers:    make(map[proto.PartitionRef]*batcher),
+		idempSeqs:   make(map[proto.PartitionRef]uint64),
 	}
 	for _, opt := range opts {
 		opt(p)
+	}
+	if p.idempotent {
+		id, err := newProducerID()
+		if err != nil {
+			return nil, fmt.Errorf("sdk: producer-id: %w", err)
+		}
+		p.producerID = id
 	}
 	// Auto-enable sticky partitioning during the linger window so
 	// keyless records consistently fill the same batch instead of
@@ -163,6 +275,13 @@ func NewProducer(t Transport, opts ...ProducerOption) (*Producer, error) {
 //
 // Without linger, Send issues a single Publish RPC and returns the
 // assigned offset.
+//
+// When the Producer is constructed with WithIdempotency, Send stamps
+// the record with HeaderProducerID + HeaderProducerSeq so the broker
+// can recognize and dedup retries of an already-applied write.
+// Stamping happens once per Send: the rate-limit retry loop reuses
+// the same sequence number across attempts so a network-induced
+// retry of an already-applied write surfaces as a duplicate.
 func (p *Producer) Send(ctx context.Context, topic string, r proto.Record) (int64, error) {
 	if err := p.checkOpen(); err != nil {
 		return 0, err
@@ -171,8 +290,17 @@ func (p *Producer) Send(ctx context.Context, topic string, r proto.Record) (int6
 	if err != nil {
 		return 0, err
 	}
+	if p.idempotent {
+		p.mu.Lock()
+		r = p.stampIdempotencyHeaders(pref, r)
+		p.mu.Unlock()
+	}
 	if p.linger > 0 {
-		return p.enqueue(ctx, pref, r)
+		offset, err := p.enqueue(ctx, pref, r)
+		if err == nil {
+			p.fireOnSent(pref, offset)
+		}
+		return offset, err
 	}
 	offset, err := p.publishWithRetry(ctx, pref, r)
 	if err != nil {
@@ -183,7 +311,18 @@ func (p *Producer) Send(ctx context.Context, topic string, r proto.Record) (int6
 			return offset, fmt.Errorf("sdk: sync after produce: %w", err)
 		}
 	}
+	p.fireOnSent(pref, offset)
 	return offset, nil
+}
+
+// fireOnSent runs every registered OnSent hook with (partition,
+// offset). Hooks are called in registration order. Errors and
+// panics in hooks are NOT caught — they propagate to the Send
+// caller, mirroring the synchronous publish-error behavior.
+func (p *Producer) fireOnSent(pref proto.PartitionRef, offset int64) {
+	for _, fn := range p.onSent {
+		fn(pref, offset)
+	}
 }
 
 // publishWithRetry wraps transport.Publish with backoff-retry on
@@ -257,7 +396,81 @@ func (p *Producer) SendBatch(ctx context.Context, topic string, records []proto.
 			return offsets, fmt.Errorf("sdk: sync after batch: %w", err)
 		}
 	}
+	for _, off := range offsets {
+		p.fireOnSent(pref, off)
+	}
 	return offsets, nil
+}
+
+// SendNoWait enqueues r for the topic and returns immediately.
+// With linger > 0 the record sits in the per-partition batcher
+// until the linger window expires or the batch fills; without
+// linger SendNoWait fires off a publish goroutine. The caller
+// doesn't get the assigned offset and doesn't observe per-record
+// errors — fire-and-forget semantics for telemetry firehoses,
+// log shipping, and other "lossy is OK" pipelines.
+//
+// Flush failures during the eventual send increment the
+// Producer's asynchronous error counter, observable via
+// AsyncErrors(). Callers that need exactly-once or per-record
+// error reporting should use Send instead.
+func (p *Producer) SendNoWait(ctx context.Context, topic string, r proto.Record) error {
+	if err := p.checkOpen(); err != nil {
+		return err
+	}
+	pref, err := p.route(ctx, topic, r)
+	if err != nil {
+		return err
+	}
+	if p.idempotent {
+		p.mu.Lock()
+		r = p.stampIdempotencyHeaders(pref, r)
+		p.mu.Unlock()
+	}
+	if p.linger > 0 {
+		return p.enqueueNoWait(pref, r)
+	}
+	// No linger — fire a publish goroutine and return. Errors hit
+	// the async-errors counter rather than the caller.
+	go func() {
+		if _, err := p.publishWithRetry(context.Background(), pref, r); err != nil {
+			p.recordAsyncError()
+		}
+	}()
+	return nil
+}
+
+// AsyncErrors returns the cumulative count of SendNoWait flushes
+// that failed since this Producer was created. Useful for liveness
+// monitoring; a steadily increasing counter signals broker
+// trouble that fire-and-forget callers can't see directly.
+func (p *Producer) AsyncErrors() int64 {
+	return p.asyncErrors.Load()
+}
+
+// recordAsyncError bumps the async-error counter. Called by the
+// batcher when a flush carries records whose callers chose
+// fire-and-forget delivery.
+func (p *Producer) recordAsyncError() {
+	p.asyncErrors.Add(1)
+}
+
+// enqueueNoWait is the SendNoWait equivalent of enqueue: adds the
+// record to the partition's batcher without blocking on the
+// flush.
+func (p *Producer) enqueueNoWait(pref proto.PartitionRef, r proto.Record) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errors.New("sdk: producer is closed")
+	}
+	b, ok := p.batchers[pref]
+	if !ok {
+		b = newBatcher(p, pref)
+		p.batchers[pref] = b
+	}
+	p.mu.Unlock()
+	return b.addNoWait(r)
 }
 
 // Flush forces every per-partition batcher to drain immediately,

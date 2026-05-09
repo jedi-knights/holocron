@@ -1,6 +1,7 @@
 package groups
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"testing"
@@ -174,5 +175,88 @@ func TestManager_NoOverlapAcrossMembers(t *testing.T) {
 		if got[i].Partition == got[i+1].Partition {
 			t.Fatalf("partition %v assigned twice", got[i].Partition)
 		}
+	}
+}
+
+// TestManager_HeartbeatWaitReturnsOnPeerJoin proves the long-poll
+// heartbeat path: a member calls HeartbeatWait with a non-zero
+// maxWait, the call blocks until a peer joins the group (which forces
+// a rebalance), and then returns RebalanceNeeded=true near-instantly.
+//
+// Without this, the existing member's notice would lag the rebalance
+// by up to one heartbeat-interval — the gap during which the broker
+// rebalances and the existing member keeps pumping records under a
+// stale generation.
+func TestManager_HeartbeatWaitReturnsOnPeerJoin(t *testing.T) {
+	// Arrange
+	m, _ := newTestManager(t)
+	a, err := m.Join("g", "", []string{"events"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		hb  HeartbeatResult
+		err error
+	}
+	done := make(chan result, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Act — kick off the long-poll heartbeat in a goroutine.
+	go func() {
+		hb, err := m.HeartbeatWait(ctx, "g", a.MemberID, a.Generation, time.Second)
+		done <- result{hb, err}
+	}()
+
+	// Give the goroutine a moment to register its watcher under the lock.
+	time.Sleep(20 * time.Millisecond)
+
+	// Trigger a rebalance by joining a second member.
+	if _, err := m.Join("g", "", []string{"events"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert — the heartbeat must have returned RebalanceNeeded=true
+	// well before its 1s long-poll deadline.
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("HeartbeatWait error: %v", r.err)
+		}
+		if !r.hb.RebalanceNeeded {
+			t.Fatal("expected RebalanceNeeded=true after peer joined")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("HeartbeatWait did not return within 500ms after peer joined — long-poll signal not delivered")
+	}
+}
+
+// TestManager_HeartbeatWaitTimesOutWhenIdle proves that HeartbeatWait
+// returns cleanly with RebalanceNeeded=false after maxWait elapses
+// when no rebalance occurs.
+func TestManager_HeartbeatWaitTimesOutWhenIdle(t *testing.T) {
+	// Arrange
+	m, _ := newTestManager(t)
+	a, err := m.Join("g", "", []string{"events"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Act
+	start := time.Now()
+	hb, err := m.HeartbeatWait(context.Background(), "g", a.MemberID, a.Generation, 80*time.Millisecond)
+	elapsed := time.Since(start)
+
+	// Assert
+	if err != nil {
+		t.Fatalf("HeartbeatWait error: %v", err)
+	}
+	if hb.RebalanceNeeded {
+		t.Errorf("RebalanceNeeded: got true, want false (no rebalance occurred)")
+	}
+	if elapsed < 80*time.Millisecond {
+		t.Errorf("returned in %v — should have waited at least 80ms", elapsed)
 	}
 }

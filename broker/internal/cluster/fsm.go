@@ -48,9 +48,33 @@ func (f *FSM) Apply(rl *raft.Log) any {
 		return f.applyAppend(body)
 	case CmdCreateTopic:
 		return f.applyCreateTopic(body)
+	case CmdDeleteTopic:
+		return f.applyDeleteTopic(body)
+	case CmdUpdateTopicConfig:
+		return f.applyUpdateTopicConfig(body)
 	default:
 		return fmt.Errorf("cluster: unknown command kind 0x%02x", byte(kind))
 	}
+}
+
+func (f *FSM) applyUpdateTopicConfig(body []byte) any {
+	cmd, err := DecodeUpdateTopicConfig(body)
+	if err != nil {
+		return err
+	}
+	return f.registry.UpdateConfig(cmd.Name, cmd.RetentionMs, cmd.SegmentBytes)
+}
+
+func (f *FSM) applyDeleteTopic(body []byte) any {
+	cmd, err := DecodeDeleteTopic(body)
+	if err != nil {
+		return err
+	}
+	// Idempotent: if the topic is already gone (e.g. snapshot
+	// restored a state that already lacks it), the registry returns
+	// ErrTopicNotFound and we treat it as success.
+	_ = f.registry.Delete(cmd.Name)
+	return f.store.DeleteTopic(context.Background(), cmd.Name)
 }
 
 func (f *FSM) applyAppend(body []byte) any {
