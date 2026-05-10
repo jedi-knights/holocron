@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jedi-knights/holocron/broker/inproc"
+	"github.com/jedi-knights/holocron/broker/internal/auth"
 	"github.com/jedi-knights/holocron/broker/internal/broker"
 	"github.com/jedi-knights/holocron/broker/internal/cluster"
 	"github.com/jedi-knights/holocron/broker/internal/groups"
@@ -447,6 +448,7 @@ type ListenOption func(*listenOpts)
 type listenOpts struct {
 	tlsConfig *tls.Config
 	apiKeys   []string
+	verifier  auth.TokenVerifier
 	quotas    map[string]server.Quota
 	acls      map[string]server.ACL
 }
@@ -468,8 +470,25 @@ func WithTLS(cfg *tls.Config) ListenOption {
 // WithAPIKeys configures the set of API keys this broker will accept
 // in the wire handshake. SDK clients send their key via
 // `holocronnet.WithAPIKey(...)`. Empty list disables authentication.
+//
+// Equivalent to WithAuthVerifier(auth.NewAPIKeyVerifier(keys...)) and
+// preserved for the legacy bearer-token deployment shape; new
+// deployments should use WithAuthVerifier with an Ed25519Verifier
+// (signed JWTs).
 func WithAPIKeys(keys ...string) ListenOption {
 	return func(o *listenOpts) { o.apiKeys = keys }
+}
+
+// WithAuthVerifier installs an auth.TokenVerifier on the wire
+// listener. The verifier is consulted once per connection at
+// handshake; a credential it rejects fails the connection with
+// StatusUnauthorized before any other RPC runs.
+//
+// Cannot be combined with WithAPIKeys — supply one or the other. When
+// neither is set, the listener defaults to AnonymousVerifier (every
+// handshake admits, every Principal is Anonymous).
+func WithAuthVerifier(v auth.TokenVerifier) ListenOption {
+	return func(o *listenOpts) { o.verifier = v }
 }
 
 // Quota is re-exported from the internal server package so callers
@@ -521,7 +540,13 @@ func (b *Broker) Listen(addr string, opts ...ListenOption) (string, error) {
 		return "", errors.New("embed: already listening")
 	}
 	srv := server.New(b.core)
-	if len(cfg.apiKeys) > 0 {
+	switch {
+	case cfg.verifier != nil && len(cfg.apiKeys) > 0:
+		b.mu.Unlock()
+		return "", errors.New("embed: WithAPIKeys and WithAuthVerifier are mutually exclusive")
+	case cfg.verifier != nil:
+		srv.SetVerifier(cfg.verifier)
+	case len(cfg.apiKeys) > 0:
 		srv.SetAPIKeys(cfg.apiKeys)
 	}
 	if len(cfg.quotas) > 0 {

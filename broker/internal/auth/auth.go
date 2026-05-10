@@ -71,6 +71,11 @@ const (
 	// TLS client certificate (CN-to-subject mapping configured via
 	// the daemon's --auth-mtls-cn-mapping flag, landing in PR 4).
 	SourceMTLS = "mtls"
+	// SourceAPIKey indicates the Principal was derived from a legacy
+	// opaque bearer key (CredentialAPIKey). Carried through wire v10
+	// as a transition shape; deployments are expected to migrate to
+	// SourceJWT.
+	SourceAPIKey = "api-key"
 )
 
 // Credential is what a client presents at handshake to identify

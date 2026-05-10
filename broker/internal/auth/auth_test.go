@@ -387,6 +387,56 @@ func TestEd25519Verifier_HonorsNbfLeeway(t *testing.T) {
 	}
 }
 
+func TestAPIKeyVerifier_AcceptsKnownKey(t *testing.T) {
+	// Arrange
+	v := auth.NewAPIKeyVerifier("alpha", "bravo")
+
+	// Act
+	p, err := v.Verify(auth.Credential{Kind: auth.CredentialAPIKey, Bytes: []byte("alpha")})
+
+	// Assert
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if p.Subject != "alpha" {
+		t.Errorf("Subject: got %q, want %q", p.Subject, "alpha")
+	}
+	if p.Source != auth.SourceAPIKey {
+		t.Errorf("Source: got %q, want %q", p.Source, auth.SourceAPIKey)
+	}
+}
+
+func TestAPIKeyVerifier_RejectsUnknownKey(t *testing.T) {
+	// Arrange
+	v := auth.NewAPIKeyVerifier("alpha")
+
+	// Act
+	_, err := v.Verify(auth.Credential{Kind: auth.CredentialAPIKey, Bytes: []byte("beta")})
+
+	// Assert
+	if err == nil {
+		t.Fatal("expected error for unknown API key")
+	}
+}
+
+func TestAPIKeyVerifier_RejectsAnonymous(t *testing.T) {
+	// An API-key verifier is opt-in to auth-required mode; anonymous
+	// handshake must be rejected.
+	v := auth.NewAPIKeyVerifier("alpha")
+	if _, err := v.Verify(auth.Credential{Kind: auth.CredentialNone}); err == nil {
+		t.Fatal("expected error for anonymous credential")
+	}
+}
+
+func TestAPIKeyVerifier_RejectsJWT(t *testing.T) {
+	// APIKeyVerifier handles only API-key credentials; a JWT
+	// credential is the wrong kind for this verifier.
+	v := auth.NewAPIKeyVerifier("alpha")
+	if _, err := v.Verify(auth.Credential{Kind: auth.CredentialJWT, Bytes: []byte("eyJ...")}); err == nil {
+		t.Fatal("expected error for JWT credential against APIKeyVerifier")
+	}
+}
+
 func TestMemoryDenyList_SetAtomicallyReplaces(t *testing.T) {
 	// Arrange
 	d := auth.NewMemoryDenyList("alice", "bob")
