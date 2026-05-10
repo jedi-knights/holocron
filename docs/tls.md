@@ -110,7 +110,45 @@ go run ./examples/consumer --addr 127.0.0.1:9092 --tls-ca cert.pem
 
 `HOLOCRON_TLS_CA` is honoured as the env-var fallback for `--tls-ca` so the same config can be set process-wide.
 
+## Cluster (Raft) TLS
+
+Multi-node clusters add a second wire surface: the Raft transport that nodes use to replicate writes and elect leaders. Cluster TLS is **symmetric mTLS** — every node is both a server (accepting peer connections) and a client (dialing peers), so cert, key, and CA are mandatory together. Half-encrypted Raft is not a supported state.
+
+### Trust model
+
+Every node in the cluster must trust the same CA. The simplest production layout is a single internal CA that signs one cert per node, with the node's host or Raft bind address in the cert's SAN. The same CA bundle plays both roles: it verifies inbound peer certs (`ClientCAs`) and outbound peer certs (`RootCAs`).
+
+### Enabling cluster TLS
+
+```bash
+holocrond \
+  --data-dir /var/lib/holocron \
+  --listen 0.0.0.0:9092 \
+  --cluster --node-id n1 \
+  --raft-listen 0.0.0.0:9192 \
+  --peers 'n1=10.0.0.1:9192=10.0.0.1:9092,n2=10.0.0.2:9192=10.0.0.2:9092,n3=10.0.0.3:9192=10.0.0.3:9092' \
+  --bootstrap \
+  --cluster-tls-cert /etc/holocron/raft-n1.pem \
+  --cluster-tls-key /etc/holocron/raft-n1-key.pem \
+  --cluster-tls-ca /etc/holocron/raft-ca.pem
+```
+
+The startup banner reports the Raft transport scheme alongside the wire scheme:
+
+```
+listening on 0.0.0.0:9092 (wire v1, TLS 1.3)
+cluster: node n1, raft 0.0.0.0:9192 [TLS 1.3 (mTLS required)], peers=3, bootstrap=true
+```
+
+Client and cluster TLS are independent — you can run plaintext clients with TLS-only Raft, or vice versa. In production you almost always want both.
+
+### Server-name override
+
+The default verification expects the peer cert's SAN to include the address being dialed (the peer's `--raft-listen` or its `AdvertiseAddr`). If your CA issues certs with a different identity (e.g., a fixed cluster-wide CN like `holocron-raft`), supply `--cluster-tls-server-name holocron-raft` so verification uses that name instead. For most deployments — where each node's cert lists its actual hostname or IP in the SAN — this flag should stay unset.
+
 ## Configuration reference
+
+### Wire (client-facing) TLS
 
 | Flag | Env | Default | Purpose |
 |---|---|---|---|
@@ -120,8 +158,17 @@ go run ./examples/consumer --addr 127.0.0.1:9092 --tls-ca cert.pem
 | `--tls-require-client-cert` | `HOLOCRON_TLS_REQUIRE_CLIENT_CERT` | `false` | Reject clients without a verified cert. Requires `--tls-client-ca`. |
 | `--tls-min-version` | `HOLOCRON_TLS_MIN_VERSION` | `1.3` | Minimum TLS version: `1.2` or `1.3`. |
 
+### Cluster (Raft) TLS
+
+| Flag | Env | Default | Purpose |
+|---|---|---|---|
+| `--cluster-tls-cert` | `HOLOCRON_CLUSTER_TLS_CERT` | — | PEM cert chain for the Raft transport. Presence enables cluster TLS — mTLS mandatory. |
+| `--cluster-tls-key` | `HOLOCRON_CLUSTER_TLS_KEY` | — | PEM private key matching `--cluster-tls-cert`. |
+| `--cluster-tls-ca` | `HOLOCRON_CLUSTER_TLS_CA` | — | PEM CA bundle that signs every peer's cert. Required when cert + key are supplied. |
+| `--cluster-tls-server-name` | `HOLOCRON_CLUSTER_TLS_SERVER_NAME` | — | Expected SAN on peer certs when dialing. Only needed when peer certs do not carry their bind addresses. |
+
 ## Limitations and roadmap
 
 - **Cert rotation requires a restart.** Cert material is read once at startup. Hot-reload on `SIGHUP` is a planned follow-on after PR 6.
-- **Cluster (Raft) traffic is still plaintext** until PR 5 lands. If you run a `--cluster` deployment, make sure the Raft port stays on a trusted network until then.
+- **`holocronctl` does not yet accept TLS flags.** PR 6 closes this — until then, operator commands against a TLS broker need a wrapper that supplies a TLS-aware transport.
 - **No client cert → identity mapping yet.** Required mTLS confirms the client holds a cert signed by the configured CA but does not yet derive an authenticated principal from it. JWT/account-based auth is the next item in Wave 1 after the TLS sequence completes.
