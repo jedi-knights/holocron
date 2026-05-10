@@ -500,21 +500,21 @@ func (s *Server) dispatch(op proto.OpCode, p auth.Principal, body []byte, w io.W
 	case proto.OpMetadata:
 		return s.handleMetadata(body, w)
 	case proto.OpCreateTopic:
-		return s.handleCreateTopic(body, w)
+		return s.handleCreateTopic(p, body, w)
 	case proto.OpHighWater:
 		return s.handleHighWater(body, w)
 	case proto.OpClusterMembers:
 		return s.handleClusterMembers(body, w)
 	case proto.OpAddVoter:
-		return s.handleAddVoter(body, w)
+		return s.handleAddVoter(p, body, w)
 	case proto.OpRemoveVoter:
-		return s.handleRemoveVoter(body, w)
+		return s.handleRemoveVoter(p, body, w)
 	case proto.OpListSegments:
 		return s.handleListSegments(body, w)
 	case proto.OpFetchSegmentChunk:
 		return s.handleFetchSegmentChunk(body, w)
 	case proto.OpDeleteTopic:
-		return s.handleDeleteTopic(body, w)
+		return s.handleDeleteTopic(p, body, w)
 	case proto.OpListTopics:
 		return s.handleListTopics(body, w)
 	case proto.OpListGroups:
@@ -528,7 +528,7 @@ func (s *Server) dispatch(op proto.OpCode, p auth.Principal, body []byte, w io.W
 	case proto.OpClusterStatus:
 		return s.handleClusterStatus(body, w)
 	case proto.OpUpdateTopicConfig:
-		return s.handleUpdateTopicConfig(body, w)
+		return s.handleUpdateTopicConfig(p, body, w)
 	case proto.OpCommit:
 		return s.handleCommit(body, w)
 	case proto.OpJoinGroup:
@@ -674,8 +674,12 @@ func (s *Server) handleClusterMembers(body []byte, w io.Writer) error {
 }
 
 // handleAddVoter is leader-only. Followers redirect via StatusNotLeader
-// so the SDK can re-dial the leader.
-func (s *Server) handleAddVoter(body []byte, w io.Writer) error {
+// so the SDK can re-dial the leader. Cluster ops require the bare-verb
+// admin scope (resource = "") since they don't target a specific topic.
+func (s *Server) handleAddVoter(p auth.Principal, body []byte, w io.Writer) error {
+	if err := s.authorize(p, auth.ActionAdmin, ""); err != nil {
+		return proto.WriteErrorResponse(w, proto.OpAddVoter, proto.StatusForbidden, err.Error())
+	}
 	req, err := proto.DecodeAddVoterRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpAddVoter, proto.StatusInvalidRequest, err.Error())
@@ -694,8 +698,12 @@ func (s *Server) handleAddVoter(body []byte, w io.Writer) error {
 	return proto.WriteResponse(w, proto.OpAddVoter, proto.StatusOK, nil)
 }
 
-// handleRemoveVoter is leader-only.
-func (s *Server) handleRemoveVoter(body []byte, w io.Writer) error {
+// handleRemoveVoter is leader-only. Cluster ops require the bare-verb
+// admin scope (resource = "").
+func (s *Server) handleRemoveVoter(p auth.Principal, body []byte, w io.Writer) error {
+	if err := s.authorize(p, auth.ActionAdmin, ""); err != nil {
+		return proto.WriteErrorResponse(w, proto.OpRemoveVoter, proto.StatusForbidden, err.Error())
+	}
 	req, err := proto.DecodeRemoveVoterRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpRemoveVoter, proto.StatusInvalidRequest, err.Error())
@@ -728,10 +736,13 @@ func (s *Server) handleHighWater(body []byte, w io.Writer) error {
 		proto.HighWaterResponse{HighWater: hw}.Encode())
 }
 
-func (s *Server) handleCreateTopic(body []byte, w io.Writer) error {
+func (s *Server) handleCreateTopic(p auth.Principal, body []byte, w io.Writer) error {
 	req, err := proto.DecodeCreateTopicRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpCreateTopic, proto.StatusInvalidRequest, err.Error())
+	}
+	if err := s.authorize(p, auth.ActionAdmin, req.Name); err != nil {
+		return proto.WriteErrorResponse(w, proto.OpCreateTopic, proto.StatusForbidden, err.Error())
 	}
 	err = s.core.CreateTopic(topic.Spec{
 		Name:           req.Name,
@@ -745,10 +756,13 @@ func (s *Server) handleCreateTopic(body []byte, w io.Writer) error {
 	return proto.WriteResponse(w, proto.OpCreateTopic, proto.StatusOK, nil)
 }
 
-func (s *Server) handleUpdateTopicConfig(body []byte, w io.Writer) error {
+func (s *Server) handleUpdateTopicConfig(p auth.Principal, body []byte, w io.Writer) error {
 	req, err := proto.DecodeUpdateTopicConfigRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpUpdateTopicConfig, proto.StatusInvalidRequest, err.Error())
+	}
+	if err := s.authorize(p, auth.ActionAdmin, req.Name); err != nil {
+		return proto.WriteErrorResponse(w, proto.OpUpdateTopicConfig, proto.StatusForbidden, err.Error())
 	}
 	if err := s.core.UpdateTopicConfig(req.Name, req.RetentionMs, req.SegmentBytes); err != nil {
 		return s.respondError(w, proto.OpUpdateTopicConfig, err)
@@ -756,10 +770,13 @@ func (s *Server) handleUpdateTopicConfig(body []byte, w io.Writer) error {
 	return proto.WriteResponse(w, proto.OpUpdateTopicConfig, proto.StatusOK, nil)
 }
 
-func (s *Server) handleDeleteTopic(body []byte, w io.Writer) error {
+func (s *Server) handleDeleteTopic(p auth.Principal, body []byte, w io.Writer) error {
 	req, err := proto.DecodeDeleteTopicRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpDeleteTopic, proto.StatusInvalidRequest, err.Error())
+	}
+	if err := s.authorize(p, auth.ActionAdmin, req.Name); err != nil {
+		return proto.WriteErrorResponse(w, proto.OpDeleteTopic, proto.StatusForbidden, err.Error())
 	}
 	if err := s.core.DeleteTopic(req.Name); err != nil {
 		return s.respondError(w, proto.OpDeleteTopic, err)

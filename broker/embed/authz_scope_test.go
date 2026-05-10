@@ -26,17 +26,12 @@ func TestEmbed_Authz_DeniesProduceWithoutScope(t *testing.T) {
 		// No Scopes — must be denied.
 	})
 
-	addr := startVerifierBroker(t, pub)
+	addr := startVerifierBroker(t, pub, "events")
 	tr := mustDialWithJWT(t, addr, token)
 	defer tr.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := tr.CreateTopic(ctx, "events", 1); err != nil {
-		// CreateTopic isn't authorized in PR 2; only produce/fetch are.
-		// Topic-create stays open so the rest of the test can proceed.
-		t.Fatalf("CreateTopic should still admit (PR 3 adds admin authz): %v", err)
-	}
 
 	p, _ := sdk.NewProducer(tr)
 	defer p.Close()
@@ -58,15 +53,12 @@ func TestEmbed_Authz_AllowsProduceWithMatchingScope(t *testing.T) {
 		Expires: time.Now().Add(time.Hour).Unix(),
 	})
 
-	addr := startVerifierBroker(t, pub)
+	addr := startVerifierBroker(t, pub, "events")
 	tr := mustDialWithJWT(t, addr, token)
 	defer tr.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := tr.CreateTopic(ctx, "events", 1); err != nil {
-		t.Fatal(err)
-	}
 
 	p, _ := sdk.NewProducer(tr)
 	defer p.Close()
@@ -83,15 +75,12 @@ func TestEmbed_Authz_AllowsProduceWildcard(t *testing.T) {
 		Expires: time.Now().Add(time.Hour).Unix(),
 	})
 
-	addr := startVerifierBroker(t, pub)
+	addr := startVerifierBroker(t, pub, "anything")
 	tr := mustDialWithJWT(t, addr, token)
 	defer tr.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := tr.CreateTopic(ctx, "anything", 1); err != nil {
-		t.Fatal(err)
-	}
 	p, _ := sdk.NewProducer(tr)
 	defer p.Close()
 	if _, err := p.Send(ctx, "anything", proto.Record{Value: []byte("x")}); err != nil {
@@ -108,15 +97,12 @@ func TestEmbed_Authz_DeniesProduceCrossVerb(t *testing.T) {
 		Expires: time.Now().Add(time.Hour).Unix(),
 	})
 
-	addr := startVerifierBroker(t, pub)
+	addr := startVerifierBroker(t, pub, "events")
 	tr := mustDialWithJWT(t, addr, token)
 	defer tr.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := tr.CreateTopic(ctx, "events", 1); err != nil {
-		t.Fatal(err)
-	}
 	p, _ := sdk.NewProducer(tr)
 	defer p.Close()
 	_, err := p.Send(ctx, "events", proto.Record{Value: []byte("payload")})
@@ -137,15 +123,12 @@ func TestEmbed_Authz_DeniesFetchWithoutScope(t *testing.T) {
 		Expires: time.Now().Add(time.Hour).Unix(),
 	})
 
-	addr := startVerifierBroker(t, pub)
+	addr := startVerifierBroker(t, pub, "events")
 	tr := mustDialWithJWT(t, addr, token)
 	defer tr.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := tr.CreateTopic(ctx, "events", 1); err != nil {
-		t.Fatal(err)
-	}
 	// Direct fetch via the transport — surfaces the StatusForbidden
 	// without going through the long-poll consumer wrapper.
 	_, err := tr.HighWater(ctx, proto.PartitionRef{Topic: "events", Index: 0})
@@ -172,12 +155,20 @@ func TestEmbed_Authz_DeniesFetchWithoutScope(t *testing.T) {
 }
 
 // startVerifierBroker brings up an in-memory broker with the given
-// public Ed25519 key configured as the JWT verifier. Returns the
-// listener's bind address.
-func startVerifierBroker(t *testing.T, pub ed25519.PublicKey) string {
+// public Ed25519 key configured as the JWT verifier. The supplied
+// topics are pre-created via the embed handle (bypassing the wire
+// layer's admin-scope check) so tests can focus on the produce /
+// consume / admin path under test. Returns the listener's bind
+// address.
+func startVerifierBroker(t *testing.T, pub ed25519.PublicKey, topics ...string) string {
 	t.Helper()
 	b := embed.NewMemory()
 	t.Cleanup(func() { _ = b.Close() })
+	for _, name := range topics {
+		if err := b.CreateTopic(embed.TopicSpec{Name: name, PartitionCount: 1}); err != nil {
+			t.Fatalf("pre-create topic %q: %v", name, err)
+		}
+	}
 	addr, err := b.Listen("127.0.0.1:0", embed.WithAuthVerifier(auth.NewEd25519Verifier(pub)))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
