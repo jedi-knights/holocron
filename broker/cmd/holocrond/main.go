@@ -48,6 +48,10 @@ func run(args []string) error {
 	tlsClientCA := fs.String("tls-client-ca", envOrDefault("HOLOCRON_TLS_CLIENT_CA", ""), "PEM CA bundle for client-cert verification (optional mTLS unless --tls-require-client-cert)")
 	tlsRequireClient := fs.Bool("tls-require-client-cert", boolEnvOrDefault("HOLOCRON_TLS_REQUIRE_CLIENT_CERT", false), "reject clients that do not present a cert verified by --tls-client-ca")
 	tlsMinVer := fs.String("tls-min-version", envOrDefault("HOLOCRON_TLS_MIN_VERSION", "1.3"), "minimum TLS version: 1.2 or 1.3 (default 1.3)")
+	clusterTLSCert := fs.String("cluster-tls-cert", envOrDefault("HOLOCRON_CLUSTER_TLS_CERT", ""), "PEM cert chain for the Raft transport (presence enables cluster TLS — mTLS mandatory)")
+	clusterTLSKey := fs.String("cluster-tls-key", envOrDefault("HOLOCRON_CLUSTER_TLS_KEY", ""), "PEM private key matching --cluster-tls-cert")
+	clusterTLSCA := fs.String("cluster-tls-ca", envOrDefault("HOLOCRON_CLUSTER_TLS_CA", ""), "PEM CA bundle that signs every peer's cert; used for both inbound and outbound verification")
+	clusterTLSServerName := fs.String("cluster-tls-server-name", envOrDefault("HOLOCRON_CLUSTER_TLS_SERVER_NAME", ""), "expected SAN on peer certs when dialing (override only when peer certs do not carry their bind addresses)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -58,6 +62,14 @@ func run(args []string) error {
 	}
 	if tlsCfg != nil && *listen == "" {
 		return errors.New("TLS flags require --listen (TLS applies to the wire listener; it cannot be configured without one)")
+	}
+
+	clusterTLSCfg, err := loadClusterTLS(*clusterTLSCert, *clusterTLSKey, *clusterTLSCA, *clusterTLSServerName)
+	if err != nil {
+		return err
+	}
+	if clusterTLSCfg != nil && !*clusterMode {
+		return errors.New("--cluster-tls-* flags require --cluster (cluster TLS protects the Raft transport, which only runs in cluster mode)")
 	}
 
 	fmt.Printf("holocrond — stage %s\n", stage)
@@ -90,9 +102,14 @@ func run(args []string) error {
 				BindAddr:  *raftBind,
 				Peers:     peerList,
 				Bootstrap: *bootstrap,
+				TLSConfig: clusterTLSCfg,
 			}))
-			fmt.Printf("cluster: node %s, raft %s, peers=%d, bootstrap=%v\n",
-				*nodeID, *raftBind, len(peerList), *bootstrap)
+			raftScheme := "plain"
+			if clusterTLSCfg != nil {
+				raftScheme = "TLS 1.3 (mTLS required)"
+			}
+			fmt.Printf("cluster: node %s, raft %s [%s], peers=%d, bootstrap=%v\n",
+				*nodeID, *raftBind, raftScheme, len(peerList), *bootstrap)
 		}
 		var err error
 		b, err = embed.NewDisk(*dataDir, opts...)
@@ -171,6 +188,36 @@ func loadWireTLS(cert, key, clientCA string, requireClientCert bool, minVer stri
 		RequireClientCert: requireClientCert,
 		MinVersion:        min,
 	})
+}
+
+// loadClusterTLS returns a *tls.Config for inter-node Raft traffic, or
+// nil when no cluster-TLS flag is set. Cluster TLS is symmetric mTLS:
+// every node both listens for and dials peers, so cert, key, and CA
+// must all be supplied together. The same CA pool is used as both
+// ClientCAs (verifying inbound peer certs) and RootCAs (verifying
+// outbound peer certs). Serverside ClientAuth is RequireAndVerifyClient-
+// Cert — half-encrypted Raft is not a supported state.
+func loadClusterTLS(cert, key, ca, serverName string) (*tls.Config, error) {
+	if cert == "" && key == "" && ca == "" {
+		return nil, nil
+	}
+	if cert == "" || key == "" || ca == "" {
+		return nil, errors.New("--cluster-tls-cert, --cluster-tls-key, and --cluster-tls-ca must all be supplied together")
+	}
+	cfg, err := tlsconfig.Load(tlsconfig.Options{
+		CertFile:          cert,
+		KeyFile:           key,
+		ClientCAFile:      ca,
+		RequireClientCert: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	cfg.RootCAs = cfg.ClientCAs
+	if serverName != "" {
+		cfg.ServerName = serverName
+	}
+	return cfg, nil
 }
 
 // parseTLSVersion maps the operator-facing "1.2" / "1.3" string to the
