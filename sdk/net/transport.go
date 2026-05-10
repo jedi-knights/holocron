@@ -841,7 +841,17 @@ type connection struct {
 func (c *connection) handshake() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	body := proto.HandshakeRequest{Version: proto.WireVersion, APIKey: c.apiKey}.Encode()
+	// Wire v10 carries credentials as a kind-tagged byte slice. PR 2
+	// preserves the existing WithAPIKey behaviour by encoding the
+	// stored key as CredentialAPIKey; PR 5 replaces the SDK option
+	// with WithCredential(Credential) so callers can hand in a JWT
+	// directly.
+	hs := proto.HandshakeRequest{Version: proto.WireVersion}
+	if c.apiKey != "" {
+		hs.CredentialKind = proto.CredentialAPIKey
+		hs.Credential = []byte(c.apiKey)
+	}
+	body := hs.Encode()
 	if err := proto.WriteFrame(c.w, proto.OpHandshake, body); err != nil {
 		return err
 	}

@@ -424,16 +424,25 @@ func (s *Server) handshake(r io.Reader, w io.Writer) (string, error) {
 			fmt.Sprintf("server speaks v%d, client v%d", proto.WireVersion, hs.Version))
 		return "", errors.New("handshake: version mismatch")
 	}
+	// Wire v10 carries the credential as a kind-tagged byte slice. PR
+	// 2 keeps the existing API-key allow-list behaviour by extracting
+	// the legacy bearer when CredentialKind == APIKey; PR 3 replaces
+	// this block with auth.TokenVerifier.Verify and threads a
+	// Principal through the rest of the request path.
+	apiKey := ""
+	if hs.CredentialKind == proto.CredentialAPIKey {
+		apiKey = string(hs.Credential)
+	}
 	s.mu.Lock()
 	keys := s.apiKeys
 	s.mu.Unlock()
 	if len(keys) > 0 {
-		if _, ok := keys[hs.APIKey]; !ok {
+		if _, ok := keys[apiKey]; !ok {
 			_ = proto.WriteErrorResponse(w, op, proto.StatusUnauthorized, "invalid API key")
 			return "", errors.New("handshake: unauthorized")
 		}
 	}
-	return hs.APIKey, proto.WriteResponse(w, op, proto.StatusOK, []byte{proto.WireVersion})
+	return apiKey, proto.WriteResponse(w, op, proto.StatusOK, []byte{proto.WireVersion})
 }
 
 func (s *Server) dispatch(op proto.OpCode, apiKey string, body []byte, w io.Writer) error {
