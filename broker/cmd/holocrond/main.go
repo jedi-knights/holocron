@@ -8,6 +8,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jedi-knights/holocron/broker/embed"
+	"github.com/jedi-knights/holocron/broker/internal/tlsconfig"
 )
 
 const stage = "5 (cluster)"
@@ -40,8 +43,21 @@ func run(args []string) error {
 	raftBind := fs.String("raft-listen", envOrDefault("HOLOCRON_RAFT_LISTEN", ":9192"), "Raft RPC bind address (cluster mode)")
 	peers := fs.String("peers", envOrDefault("HOLOCRON_PEERS", ""), "cluster membership as id=raft-addr=wire-addr,id=...,id=... (cluster mode)")
 	bootstrap := fs.Bool("bootstrap", false, "bootstrap the cluster as the first node (cluster mode)")
+	tlsCert := fs.String("tls-cert", envOrDefault("HOLOCRON_TLS_CERT", ""), "PEM cert chain for the wire listener (presence enables TLS)")
+	tlsKey := fs.String("tls-key", envOrDefault("HOLOCRON_TLS_KEY", ""), "PEM private key matching --tls-cert")
+	tlsClientCA := fs.String("tls-client-ca", envOrDefault("HOLOCRON_TLS_CLIENT_CA", ""), "PEM CA bundle for client-cert verification (optional mTLS unless --tls-require-client-cert)")
+	tlsRequireClient := fs.Bool("tls-require-client-cert", boolEnvOrDefault("HOLOCRON_TLS_REQUIRE_CLIENT_CERT", false), "reject clients that do not present a cert verified by --tls-client-ca")
+	tlsMinVer := fs.String("tls-min-version", envOrDefault("HOLOCRON_TLS_MIN_VERSION", "1.3"), "minimum TLS version: 1.2 or 1.3 (default 1.3)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	tlsCfg, err := loadWireTLS(*tlsCert, *tlsKey, *tlsClientCA, *tlsRequireClient, *tlsMinVer)
+	if err != nil {
+		return err
+	}
+	if tlsCfg != nil && *listen == "" {
+		return errors.New("TLS flags require --listen (TLS applies to the wire listener; it cannot be configured without one)")
 	}
 
 	fmt.Printf("holocrond — stage %s\n", stage)
@@ -93,12 +109,16 @@ func run(args []string) error {
 	}
 
 	if *listen != "" {
-		addr, err := b.Listen(*listen)
+		listenOpts := []embed.ListenOption{}
+		if tlsCfg != nil {
+			listenOpts = append(listenOpts, embed.WithTLS(tlsCfg))
+		}
+		addr, err := b.Listen(*listen, listenOpts...)
 		if err != nil {
 			_ = b.Close()
 			return fmt.Errorf("listen: %w", err)
 		}
-		fmt.Printf("listening on %s (wire v%d)\n", addr, 1)
+		fmt.Printf("listening on %s (wire v%d, %s)\n", addr, 1, wireSchemeDescription(tlsCfg))
 	} else {
 		fmt.Println("broker ready (network listener disabled)")
 	}
@@ -120,6 +140,78 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// boolEnvOrDefault treats "1", "true", and "yes" (case-insensitive) as
+// true. Anything else, including unset, falls back to def.
+func boolEnvOrDefault(key string, def bool) bool {
+	v := strings.ToLower(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	return v == "1" || v == "true" || v == "yes"
+}
+
+// loadWireTLS returns a *tls.Config built from the daemon's --tls-* flags,
+// or nil when no TLS flag is set. Returns an error on any malformed
+// combination: missing key, bad path, mTLS required without a CA, or an
+// unrecognised --tls-min-version.
+func loadWireTLS(cert, key, clientCA string, requireClientCert bool, minVer string) (*tls.Config, error) {
+	if cert == "" && key == "" && clientCA == "" && !requireClientCert {
+		return nil, nil
+	}
+	min, err := parseTLSVersion(minVer)
+	if err != nil {
+		return nil, err
+	}
+	return tlsconfig.Load(tlsconfig.Options{
+		CertFile:          cert,
+		KeyFile:           key,
+		ClientCAFile:      clientCA,
+		RequireClientCert: requireClientCert,
+		MinVersion:        min,
+	})
+}
+
+// parseTLSVersion maps the operator-facing "1.2" / "1.3" string to the
+// uint16 constants in crypto/tls. Empty defaults to 1.3.
+func parseTLSVersion(v string) (uint16, error) {
+	switch v {
+	case "", "1.3":
+		return tls.VersionTLS13, nil
+	case "1.2":
+		return tls.VersionTLS12, nil
+	default:
+		return 0, fmt.Errorf("--tls-min-version: expected 1.2 or 1.3, got %q", v)
+	}
+}
+
+// wireSchemeDescription summarises the wire-listener security posture for
+// the startup banner: "plain" when TLS is off, "TLS 1.3" when on, and a
+// suffix for the mTLS mode when client-cert verification is configured.
+func wireSchemeDescription(cfg *tls.Config) string {
+	if cfg == nil {
+		return "plain"
+	}
+	scheme := "TLS " + tlsVersionLabel(cfg.MinVersion)
+	switch cfg.ClientAuth {
+	case tls.RequireAndVerifyClientCert:
+		scheme += " (mTLS required)"
+	case tls.VerifyClientCertIfGiven:
+		scheme += " (mTLS optional)"
+	}
+	return scheme
+}
+
+func tlsVersionLabel(v uint16) string {
+	switch v {
+	case tls.VersionTLS13:
+		return "1.3"
+	case tls.VersionTLS12:
+		return "1.2"
+	default:
+		return fmt.Sprintf("%#x", v)
+	}
 }
 
 // parsePeers parses a "--peers" string of the form
