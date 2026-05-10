@@ -263,7 +263,7 @@ func (b *Broker) publishClustered(ctx context.Context, p proto.PartitionRef, r p
 	if !b.cluster.IsLeader() {
 		return 0, &ErrNotLeader{LeaderID: b.cluster.LeaderID(), LeaderAddr: b.cluster.LeaderWireAddr()}
 	}
-	resp, err := b.cluster.Apply(cluster.EncodeAppend(cluster.AppendCommand{
+	resp, err := b.cluster.Apply(ctx, cluster.EncodeAppend(cluster.AppendCommand{
 		Topic:     p.Topic,
 		Partition: p.Index,
 		// Offset stays unstamped until Stage 9 milestone 3 teaches
@@ -292,7 +292,12 @@ func (b *Broker) CreateTopic(spec topic.Spec) error {
 	if !b.cluster.IsLeader() {
 		return &ErrNotLeader{LeaderID: b.cluster.LeaderID(), LeaderAddr: b.cluster.LeaderWireAddr()}
 	}
-	_, err := b.cluster.Apply(cluster.EncodeCreateTopic(cluster.CreateTopicCommand{
+	// CreateTopic / UpdateTopicConfig / DeleteTopic don't yet take a
+	// ctx parameter (changing that ripples to the public embed.Broker
+	// API surface — a separate refactor). Audit-log the management
+	// operation as anonymous; PR for the embed-API ctx threading is a
+	// follow-on.
+	_, err := b.cluster.Apply(context.Background(), cluster.EncodeCreateTopic(cluster.CreateTopicCommand{
 		Name:           spec.Name,
 		PartitionCount: spec.PartitionCount,
 		RetentionMs:    spec.RetentionMs,
@@ -316,7 +321,7 @@ func (b *Broker) UpdateTopicConfig(name string, retentionMs, segmentBytes int64)
 	if !b.cluster.IsLeader() {
 		return &ErrNotLeader{LeaderID: b.cluster.LeaderID(), LeaderAddr: b.cluster.LeaderWireAddr()}
 	}
-	_, err := b.cluster.Apply(cluster.EncodeUpdateTopicConfig(cluster.UpdateTopicConfigCommand{
+	_, err := b.cluster.Apply(context.Background(), cluster.EncodeUpdateTopicConfig(cluster.UpdateTopicConfigCommand{
 		Name:         name,
 		RetentionMs:  retentionMs,
 		SegmentBytes: segmentBytes,
@@ -342,7 +347,7 @@ func (b *Broker) DeleteTopic(name string) error {
 	if !b.cluster.IsLeader() {
 		return &ErrNotLeader{LeaderID: b.cluster.LeaderID(), LeaderAddr: b.cluster.LeaderWireAddr()}
 	}
-	_, err := b.cluster.Apply(cluster.EncodeDeleteTopic(cluster.DeleteTopicCommand{Name: name}))
+	_, err := b.cluster.Apply(context.Background(), cluster.EncodeDeleteTopic(cluster.DeleteTopicCommand{Name: name}))
 	return err
 }
 
