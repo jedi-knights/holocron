@@ -32,6 +32,8 @@ Commands:
   cluster status    Show this node's Raft state and leader info
   cluster join      Add a voter to the cluster (leader-only)
   cluster leave     Remove a voter (leader-only)
+  auth issue        Sign a JWT with the operator's Ed25519 private key
+  auth inspect      Decode a JWT and print its header + claims (no verification)
 
   --version         Print build version and Go runtime info
 
@@ -98,6 +100,7 @@ func run(args []string) error {
 		{"bench", runBench},
 		{"tail", runTail},
 		{"ping", runPing},
+		{"auth", runAuth},
 	}
 	for _, c := range commands {
 		if c.name == args[0] {

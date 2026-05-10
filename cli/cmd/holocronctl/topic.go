@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/jedi-knights/holocron/cli/internal/clienttls"
@@ -61,6 +62,7 @@ func runTopicStats(args []string) error {
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -72,7 +74,11 @@ func runTopicStats(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -168,6 +174,7 @@ func runTopicUpdate(args []string) error {
 	segmentBytes := fs.Int64("segment-bytes", 0, "new segment size in bytes (0 = no change)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -182,7 +189,11 @@ func runTopicUpdate(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -215,6 +226,7 @@ func runTopicDescribe(args []string) error {
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -226,7 +238,11 @@ func runTopicDescribe(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -273,6 +289,7 @@ func runTopicDelete(args []string) error {
 	name := fs.String("topic", "", "topic name (required)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -284,7 +301,11 @@ func runTopicDelete(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -307,6 +328,7 @@ func runTopicCreate(args []string) error {
 	partitions := fs.Int("partitions", 1, "partition count")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -318,7 +340,11 @@ func runTopicCreate(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -340,6 +366,7 @@ func runTopicList(args []string) error {
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -348,7 +375,11 @@ func runTopicList(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -373,19 +404,12 @@ func runTopicList(args []string) error {
 	return nil
 }
 
-// dial opens a network transport with optional API-key auth and any
-// extra options supplied by the caller — typically holocronnet.WithTLS
-// from the per-subcommand TLS flag closure.
-//
-// The apiKey-string argument is preserved as the legacy bearer-token
-// shape for the existing --api-key flag; PR 6 adds --credential-file
-// for the JWT path.
-func dial(addr, apiKey string, extra ...holocronnet.Option) (*holocronnet.Transport, error) {
-	opts := append([]holocronnet.Option(nil), extra...)
-	if apiKey != "" {
-		opts = append(opts, holocronnet.WithCredential(sdk.APIKeyCredential(apiKey)))
-	}
-	return holocronnet.Dial(addr, opts...)
+// dial opens a network transport with the supplied options. Auth
+// (API-key or JWT) is supplied through the option slice — see
+// credentialOpts — rather than as a dedicated parameter, so the
+// helper stays agnostic to which credential shape the caller chose.
+func dial(addr string, extra ...holocronnet.Option) (*holocronnet.Transport, error) {
+	return holocronnet.Dial(addr, extra...)
 }
 
 // dialOpts converts a *tls.Config (which may be nil) into the slice of
@@ -396,4 +420,27 @@ func dialOpts(tlsCfg *tls.Config) []holocronnet.Option {
 		return nil
 	}
 	return []holocronnet.Option{holocronnet.WithTLS(tlsCfg)}
+}
+
+// credentialOpts converts the standard credential flags into
+// holocronnet.Option entries appended to base. --credential-file (a
+// JWT) and --api-key (legacy bearer) are mutually exclusive — supplying
+// both is an error. Returns base unchanged when neither is set.
+func credentialOpts(credFile, apiKey string, base ...holocronnet.Option) ([]holocronnet.Option, error) {
+	out := append([]holocronnet.Option(nil), base...)
+	if credFile != "" && apiKey != "" {
+		return nil, errors.New("--credential-file and --api-key are mutually exclusive")
+	}
+	if credFile != "" {
+		cred, err := sdk.LoadCredentialFile(credFile)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, holocronnet.WithCredential(cred))
+		return out, nil
+	}
+	if apiKey != "" {
+		out = append(out, holocronnet.WithCredential(sdk.APIKeyCredential(apiKey)))
+	}
+	return out, nil
 }
