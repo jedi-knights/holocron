@@ -1,13 +1,12 @@
 # Holocron
 
-A from-scratch, append-only event streaming platform — built to understand how systems like Apache Kafka, AWS SQS/SNS, Google Pub/Sub, and AWS EventBridge work beneath the surface.
+A single-binary, Go-native distributed log broker — NATS JetStream's operational simplicity with the per-partition ordering and Kafka-shaped log model JetStream lacks.
 
-![Status](https://img.shields.io/badge/status-feature--frozen-blue)
-![Stage](https://img.shields.io/badge/stage-8%20%2B%20sustaining-blue)
+![Maturity](https://img.shields.io/badge/maturity-pre--alpha-orange)
 ![Go](https://img.shields.io/badge/go-1.23+-00ADD8?logo=go)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Status:** Feature-frozen at end of the sustaining era (batches 21–52); Stage 9 (fresh-follower record catch-up) is **partially complete and paused** — see [`docs/stage-9.md#implementation-status`](docs/stage-9.md#implementation-status). The eight roadmap stages are complete and ~96 polish/ergonomics items have landed across SDK, CLI, streams, and observability surface. The remaining backlog items are large architectural pieces (exactly-once, per-partition Raft, sendfile, continuous replication completion, multiplexed connections, richer schema parsing) documented in [`docs/sustaining.md#deferred-work`](docs/sustaining.md#deferred-work) but not on a roadmap. The on-disk format, wire protocol, and public APIs will change without notice until the first tagged release.
+> **Status:** Pre-alpha. The foundation (Stages 1–8 plus the sustaining era — see [`docs/sustaining.md`](docs/sustaining.md)) ships disk-backed segmented storage, a network wire protocol, consumer groups, Raft-replicated clusters, a Connect tier, a schema registry, and a stream-processing library. Stage 9 (fresh-follower record catch-up) is **partially complete and paused** — see [`docs/stage-9.md#implementation-status`](docs/stage-9.md#implementation-status). Production gaps remain — TLS, authentication, multi-tenancy, and SDKs beyond Go — and are tracked in the [Roadmap](#roadmap) below. The on-disk format, wire protocol, and public APIs will change without notice until the first tagged release.
 
 ## Table of contents
 
@@ -20,6 +19,7 @@ A from-scratch, append-only event streaming platform — built to understand how
 - [Development](#development)
 - [Architecture](#architecture)
 - [Project layout](#project-layout)
+- [Comparison: Holocron vs NATS JetStream](#comparison-holocron-vs-nats-jetstream)
 - [Roadmap](#roadmap)
 - [Non-goals](#non-goals)
 - [Contributing](#contributing)
@@ -42,11 +42,11 @@ The second pattern is the foundation of **event-driven architecture**. The infra
 | AWS SNS, Google Pub/Sub | Fan-out pub/sub brokers |
 | AWS EventBridge, NATS JetStream | Event buses with content-based routing |
 
-Holocron is a single-binary Kafka-style broker, written in Go and built incrementally — each stage adds one production-grade concept and is fully runnable on its own. The name comes from the holocrons of Star Wars lore: crystalline, append-only repositories of knowledge, indexed and replayable by anyone with access.
+Holocron is a single-binary, Go-native distributed log broker. The name comes from the holocrons of Star Wars lore: crystalline, append-only repositories of knowledge, indexed and replayable by anyone with access.
 
-The platform's primitive is the **distributed log** (row 1 above), and the other three categories — message queue, pub/sub fan-out, event bus — are realized on top of it via consumer groups (Stage 4) and the Connect tier (Stage 6) without giving up the "broker stays dumb" architectural rule. See [`docs/architecture.md`](docs/architecture.md#coverage-of-the-messaging-middleware-taxonomy) for the per-category mapping.
+The platform's primitive is the **distributed log** (row 1 above), and the other three categories — message queue, pub/sub fan-out, event bus — are realized on top of it via consumer groups and the Connect tier without giving up the "broker stays dumb" architectural rule. See [`docs/architecture.md`](docs/architecture.md#coverage-of-the-messaging-middleware-taxonomy) for the per-category mapping.
 
-This is a **learning project first** and a **functional broker second**. The goal is not to compete with Kafka. The goal is a codebase where every architectural decision is small enough to read and obvious enough to justify.
+**Where Holocron fits in the market.** Holocron is positioned specifically against **NATS JetStream**, the only mainstream broker that shares its constraints — Go, single binary, no JVM, no external coordinator, no Kafka wire protocol. JetStream is excellent at messaging-and-light-persistence; it is weak at strict per-partition ordering (its model is publisher-side subject hashing; the Jepsen 2.12.1 analysis surfaced a truncation-related data-loss case, and "strict ordering" is still an open feature request upstream). Holocron's bet is to keep JetStream's deployment story and out-execute it on the log primitive itself. The full feature-by-feature comparison is in [Comparison](#comparison-holocron-vs-nats-jetstream).
 
 ## Features
 
@@ -264,27 +264,96 @@ The split exists because:
 - `examples` imports `sdk` exactly as a downstream user would, which catches accidental coupling during development.
 - `proto` holds types both `broker` and `sdk` depend on, isolated to prevent import cycles.
 
+## Comparison: Holocron vs NATS JetStream
+
+Holocron is positioned specifically against [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream). The matrix below is current as of pre-alpha and will be re-published with each milestone. "Parity" means feature equivalence at a quality bar suitable for a Go-native deployment, not exhaustive feature-for-feature mirroring.
+
+| Capability | NATS JetStream | Holocron | Status |
+|---|---|---|---|
+| Single static binary, no external dependencies | Yes | Yes | Parity |
+| Go-native server (no JVM, no sidecars) | Yes | Yes | Parity |
+| Persistent streams (file + memory backends) | Yes | Yes | Parity |
+| **Strict per-partition ordering as a broker primitive** | Weak (publisher-side subject hashing; Jepsen 2.12.1 found data loss) | Yes (per-partition single-writer, broker-enforced) | **Holocron win** |
+| **Kafka-shaped log model** (replayable by offset, segmented, indexed) | No (subject-keyed message store) | Yes | **Holocron win** |
+| Replication and leader election | Raft per-stream | Raft per-cluster (per-partition Raft on roadmap) | Parity |
+| Consumer groups with partition rebalancing | Pull/push consumers, queue groups | Yes (range assignment, generation heartbeats) | Parity |
+| Idempotent producer / broker-side dedup | Yes (message-ID dedup window) | Yes (persistent dedup) | Parity |
+| Operator CLI | `nats` | `holocronctl` (full surface, `--json` everywhere) | Parity |
+| Native stream-processing library | None | Yes (DSL, stateful ops, windows, joins) | **Holocron win** |
+| Source/sink connector framework | None | Yes (`connect/` module + reference connectors) | **Holocron win** |
+| Schema registry | None native | Yes (Confluent-shape HTTP API, broker-backed) | **Holocron win** |
+| KV store layered on the log | Yes | No | **Gap** |
+| Object store layered on the log | Yes | No | **Gap** |
+| TLS for client and intra-cluster traffic | Yes | No | **Gap (production blocker)** |
+| Authentication (JWT / NKey / accounts) | Yes | No | **Gap (production blocker)** |
+| Multi-tenancy / account isolation | Yes | No | **Gap** |
+| Mirror / source streams (cross-stream replication) | Yes | No | **Gap** |
+| Leaf nodes (edge / IoT connectivity) | Yes | No | **Gap** |
+| Cross-region / super-cluster geo-replication | Yes | No | **Gap** |
+| SDKs beyond Go | Many (TS, Python, Rust, Java, .NET, …) | Go only | **Gap** |
+
+The gaps drive the [Roadmap](#roadmap). The wins drive the positioning.
+
 ## Roadmap
 
-Each stage produces a working, runnable system. Each lands with a `docs/stage-N.md` design note explaining the *why*.
+The foundation has shipped. Going forward, work is **capability-driven** — grouped into waves prioritized by competitive gap with NATS JetStream and by what production users actually need. Each capability lands when it crosses production-quality thresholds (correct under partition, `-race` clean, documented, tested), not when scaffolding is in place.
 
-- [x] **Stage 1 — In-memory pub/sub.** Single process. Topics, partitions, fan-out subscribers. Establishes the core abstractions and the `sdk.Transport` boundary.
-- [x] **Stage 2 — Persistent append-only log.** File-backed segmented log with sparse offset index, atomic index persistence, torn-tail recovery, time-based retention. Survives restarts. `holocrond --data-dir <path>`.
-- [x] **Stage 3 — Network protocol.** TCP listener with hand-rolled length-prefixed binary framing. `sdk/net.Dial(addr)` returns an `sdk.Transport` that speaks v1 wire protocol. Long-poll Fetch, version-checked handshake, full opcode coverage for produce / fetch / metadata / commit / create-topic. Standalone `examples/producer` and `examples/consumer` now run against a real broker.
-- [x] **Stage 4 — Consumer groups and partition rebalancing.** Multiple consumers in one group cooperatively share a topic's partitions via range assignment. Generation-based heartbeats; rejoin happens in the heartbeat goroutine so revoked pumps are cancelled before new generations fetch. Offsets stored broker-durably (JSON file in the data directory; internal-topic-backed store deferred to a later stage).
-- [x] **Stage 5 — Replication and leader election.** Multi-node clusters via `hashicorp/raft`. Cluster mode is opt-in (`--cluster`); produces and topic-create operations replicate through Raft Apply. Followers redirect SDK clients to the leader's wire address with `StatusNotLeader`. Disk-backed Raft log + stable store (BoltDB), file snapshot store. End-to-end test: 3 in-process nodes, SDK dials a follower, automatic redirect, replicated to all three.
-- [x] **Stage 6 — Connect-style framework.** Source/sink connector interfaces and a `Worker` runtime in a new `connect/` module. Reference connectors: `file.Source` (tail a file → produce) and `file.Sink` (consume → append to a file). Sink tasks share a consumer group, so partition assignment scales horizontally for free (Stage 4). End-to-end demo and test prove the source → broker → sink path through the SDK.
-- [x] **Stage 7 — Optional schema registry.** Standalone `holocron-registry` daemon backed by a holocron topic (`__holocron_schemas`). Service kernel + Confluent-shaped HTTP API (`/subjects`, `/schemas/ids/{id}`, `/compatibility/...`). State recovers on startup by replaying the topic. Idempotent register, monotonic globally-unique IDs, single-partition-for-total-order, opaque schema text.
-- [x] **Stage 8 — Stream processing library.** Kafka Streams analog in a new `streams/` module. Fluent DSL: `Stream(topic).Filter().Map().GroupByKey().Count(store).To(topic)`. Stateless ops (Filter / Map / FlatMap), stateful ops (Count, Aggregate) with a `StateStore` interface and an in-memory implementation. One goroutine per pipeline. Windowing, joins, and changelog-backed stores deferred to follow-ons (compaction is the dependency).
-- [x] **Sustaining (batches 21–52).** Polish era: per-partition state stores with multi-task parallelism, changelog-backed stores with per-partition isolation, tumbling/hopping/session windows, stream-stream and stream-table joins (inner/left/outer), idempotent producer + persistent broker dedup, server-pushed rebalance via long-poll heartbeat, full operator-CLI surface (`group`, `topic`, `record`, `cluster`, `bench`, `tail`, `consume`, `produce`, `ping`, `offset` with `--json` everywhere), Producer/Consumer observability (`Stats`, `SendCount`, `Position`, `Lag`, `TotalLag`), pipeline-level error handling (`WithErrorHandler`, `WithDLQ`), DLQ + retry + transform connectors, schema-registry config + delete + Confluent-shape compat. See [`docs/sustaining.md`](docs/sustaining.md) for the per-theme breakdown.
+### Shipped
+
+The eight foundational stages plus the sustaining era are complete. Per-stage design notes are in [`docs/stage-N.md`](docs/) and the polish-era breakdown is in [`docs/sustaining.md`](docs/sustaining.md).
+
+- [x] **Stages 1–3 — In-memory pub/sub → persistent segmented log → network wire protocol.** Topics, partitions, fan-out, file-backed segments with sparse index, hand-rolled length-prefixed framing, full opcode coverage for produce / fetch / metadata / commit / create-topic.
+- [x] **Stage 4 — Consumer groups and rebalancing.** Range assignment, generation-based heartbeats, broker-durable offsets.
+- [x] **Stage 5 — Raft replication and leader election.** `hashicorp/raft`, opt-in `--cluster`, follower redirect on `StatusNotLeader`.
+- [x] **Stage 6 — Connect-style framework.** Source/sink connector interfaces, `Worker` runtime, reference file connectors.
+- [x] **Stage 7 — Schema registry.** Standalone `holocron-registry` backed by a holocron topic, Confluent-shape HTTP API.
+- [x] **Stage 8 — Stream processing library.** Fluent DSL, stateless and stateful operators, `StateStore` interface.
+- [x] **Sustaining era.** Per-partition state stores with multi-task parallelism, changelog-backed stores, tumbling/hopping/session windows, stream-stream and stream-table joins, idempotent producer + persistent broker dedup, server-pushed rebalance, full operator-CLI surface, Producer/Consumer observability (`Stats`, `Position`, `Lag`), pipeline-level error handling, DLQ + retry + transform connectors.
+
+### Wave 1 — Production-readiness (in flight)
+
+Without these, no real production user can deploy Holocron. This wave is the gate to the first tagged release.
+
+- [ ] **Stage 9 — Fresh-follower record catch-up.** Currently paused after M4; offset-gap scenario tracked in [`docs/stage-9.md`](docs/stage-9.md).
+- [ ] **TLS** for client and intra-cluster traffic.
+- [ ] **Authentication** — JWT/NKey-style credentials, scoped tokens for producers and consumers.
+- [ ] **ACLs** — per-topic publish/subscribe authorization.
+- [ ] **Multi-tenancy isolation** — account/namespace-level resource limits and topic visibility.
+
+### Wave 2 — Layered stores (closes NATS's most-used API surface)
+
+NATS JetStream's KV and Object store are heavily used in practice; closing this gap removes the most common reason a team picks JetStream over a Kafka-shaped log.
+
+- [ ] **KV store** built on a compacted holocron topic, with the same get/put/watch shape JetStream users expect.
+- [ ] **Object store** for large blobs, chunked across log records.
+
+### Wave 3 — Ecosystem reach
+
+- [ ] **Python SDK** (priority: largest non-Go user base).
+- [ ] **TypeScript SDK** (priority: edge and full-stack apps).
+- [ ] Stable, documented v1 wire protocol — the contract for non-Go clients.
+
+### Wave 4 — Distribution and edge
+
+- [ ] **Mirror / source streams** for cross-cluster replication.
+- [ ] **Leaf nodes** for edge connectivity, mirroring NATS's leaf-node model.
+- [ ] **Super-cluster-style geo-replication.**
+- [ ] **Per-partition Raft** (currently per-cluster) for write-throughput scale-out.
+
+### Wave 5 — Hardening (continuous)
+
+- [ ] **Jepsen-grade fault injection** with public, reproducible reports — the bar Holocron must clear to credibly claim a correctness advantage over JetStream.
+- [ ] **Published latency and throughput benchmarks** vs. NATS JetStream and Redpanda on the same hardware, refreshed per release.
+- [ ] **Sendfile / zero-copy on the fetch path**, multiplexed connections, and other deferred performance items from the sustaining-era backlog ([`docs/sustaining.md#deferred-work`](docs/sustaining.md#deferred-work)).
 
 ## Non-goals
 
-- Production durability guarantees on par with Kafka. Holocron is for learning and small workloads.
-- Wire-protocol compatibility with Kafka, SQS, or any other system. Holocron speaks its own protocol.
-- A managed service, a UI dashboard, or a Kubernetes operator. Those are separate problems.
-- Exactly-once semantics in the distributed-transaction sense. At-least-once with idempotent consumers is the target.
-- Content-based routing or transformation in the broker. Those live in clients or in the Connect tier.
+- **Wire-protocol compatibility with Kafka.** Holocron speaks its own protobuf-framed protocol. Targeting the Kafka API would put Holocron in Redpanda's market on Redpanda's terms, against a multi-year head start.
+- **Diskless / S3-tiered storage as a v1 differentiator.** That axis is already crowded (WarpStream, Bufstream, AutoMQ); Holocron's local-disk segment work would become throwaway. May revisit post-v1 as an opt-in backend.
+- **JVM-ecosystem connectors as launch features** — Kafka Connect, Kafka Streams, Flink. Holocron has its own native connect tier and stream-processing library.
+- **A managed service, UI dashboard, or Kubernetes operator** at this stage. Self-hosted single-binary first; managed offerings are downstream of v1.
+- **Exactly-once semantics in the distributed-transaction sense.** Idempotent producer + at-least-once delivery + consumer-side dedup is the target shape.
+- **Content-based routing or transformation in the broker.** Those live in clients, the Connect tier, or the streams library — never in the broker process.
 
 ## Contributing
 
@@ -300,4 +369,4 @@ Issues and pull requests are welcome. Please read [`CONTRIBUTING.md`](CONTRIBUTI
 
 ## Acknowledgements
 
-Holocron's design is informed by Apache Kafka, NATS JetStream, Redpanda, and the LogDevice paper. Where this codebase makes a choice that differs from those systems, the surrounding docs explain why.
+Holocron's design is informed by Apache Kafka, NATS JetStream, Redpanda, and the LogDevice paper. The competitive thesis specifically targets NATS JetStream — see [Comparison](#comparison-holocron-vs-nats-jetstream) — and where Holocron's choices diverge from JetStream or from any of the systems above, the surrounding docs explain why.
