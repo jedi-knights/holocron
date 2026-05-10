@@ -267,6 +267,43 @@ tr, err := holocronnet.Dial("broker.example.com:9092", holocronnet.WithTLS(&tls.
 
 For the full TLS configuration surface (mTLS, cluster TLS, cert generation), see [`tls.md`](tls.md).
 
+## Authentication
+
+When the broker is running with `--auth-issuer-key` (JWT-required mode), supply a credential at dial time. A JWT is the standard kind:
+
+```go
+import (
+    "github.com/jedi-knights/holocron/sdk"
+)
+
+token, err := sdk.LoadCredentialFile("/etc/holocron/my-svc.jwt")
+if err != nil {
+    log.Fatal(err)
+}
+
+tr, err := holocronnet.Dial("broker.example.com:9092",
+    holocronnet.WithCredential(token),
+)
+```
+
+Or construct the credential inline if the JWT is in memory:
+
+```go
+tr, err := holocronnet.Dial(addr,
+    holocronnet.WithCredential(sdk.JWTCredential(tokenBytes)),
+)
+```
+
+For the legacy bearer-token flow (broker configured with `--auth-api-keys` or `embed.WithAPIKeys`):
+
+```go
+tr, err := holocronnet.Dial(addr,
+    holocronnet.WithCredential(sdk.APIKeyCredential("my-shared-secret")),
+)
+```
+
+For the full operator-side auth surface (issuing tokens, denylist, configuration reference), see [`auth.md`](auth.md).
+
 ## Where to go next
 
 - [Operator guide](operator-guide.md) — running the broker daemon

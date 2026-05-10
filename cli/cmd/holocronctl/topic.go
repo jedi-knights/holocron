@@ -10,6 +10,7 @@ import (
 
 	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
+	"github.com/jedi-knights/holocron/sdk"
 	holocronnet "github.com/jedi-knights/holocron/sdk/net"
 )
 
@@ -375,10 +376,14 @@ func runTopicList(args []string) error {
 // dial opens a network transport with optional API-key auth and any
 // extra options supplied by the caller — typically holocronnet.WithTLS
 // from the per-subcommand TLS flag closure.
+//
+// The apiKey-string argument is preserved as the legacy bearer-token
+// shape for the existing --api-key flag; PR 6 adds --credential-file
+// for the JWT path.
 func dial(addr, apiKey string, extra ...holocronnet.Option) (*holocronnet.Transport, error) {
 	opts := append([]holocronnet.Option(nil), extra...)
 	if apiKey != "" {
-		opts = append(opts, holocronnet.WithAPIKey(apiKey))
+		opts = append(opts, holocronnet.WithCredential(sdk.APIKeyCredential(apiKey)))
 	}
 	return holocronnet.Dial(addr, opts...)
 }

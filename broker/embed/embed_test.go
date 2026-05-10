@@ -679,7 +679,7 @@ func TestListen_APIKey_AdmitsValid(t *testing.T) {
 	}
 
 	// Act
-	tr, err := holocronnet.Dial(addr, holocronnet.WithAPIKey("secret-A"))
+	tr, err := holocronnet.Dial(addr, holocronnet.WithCredential(sdk.APIKeyCredential("secret-A")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2015,7 +2015,7 @@ func TestACL_EnforcesPerTopicPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tr, err := holocronnet.Dial(addr, holocronnet.WithAPIKey("k1"))
+	tr, err := holocronnet.Dial(addr, holocronnet.WithCredential(sdk.APIKeyCredential("k1")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2242,7 +2242,7 @@ func TestQuota_RejectsOverQuotaProduce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tr, err := holocronnet.Dial(addr, holocronnet.WithAPIKey("key-A"))
+	tr, err := holocronnet.Dial(addr, holocronnet.WithCredential(sdk.APIKeyCredential("key-A")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2300,7 +2300,7 @@ func TestQuota_FetchSurfacesRateLimitedThroughPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prodTr, err := holocronnet.Dial(addr, holocronnet.WithAPIKey("producer"))
+	prodTr, err := holocronnet.Dial(addr, holocronnet.WithCredential(sdk.APIKeyCredential("producer")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2318,7 +2318,7 @@ func TestQuota_FetchSurfacesRateLimitedThroughPoll(t *testing.T) {
 	}
 
 	// Act
-	consTr, err := holocronnet.Dial(addr, holocronnet.WithAPIKey("consumer"))
+	consTr, err := holocronnet.Dial(addr, holocronnet.WithCredential(sdk.APIKeyCredential("consumer")))
 	if err != nil {
 		t.Fatal(err)
 	}
