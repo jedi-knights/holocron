@@ -11,6 +11,7 @@ func TestEncodeDecodeAppendRoundTrip(t *testing.T) {
 	cmd := AppendCommand{
 		Topic:     "events",
 		Partition: 3,
+		Offset:    42,
 		Record: proto.Record{
 			Timestamp: 1234,
 			Key:       []byte("k"),
@@ -33,8 +34,40 @@ func TestEncodeDecodeAppendRoundTrip(t *testing.T) {
 	if got.Topic != cmd.Topic || got.Partition != cmd.Partition {
 		t.Fatalf("metadata mismatch: %+v", got)
 	}
+	if got.Offset != cmd.Offset {
+		t.Errorf("Offset round-trip: got %d, want %d", got.Offset, cmd.Offset)
+	}
 	if !bytes.Equal(got.Record.Key, cmd.Record.Key) || !bytes.Equal(got.Record.Value, cmd.Record.Value) {
 		t.Fatalf("record mismatch: %+v", got.Record)
+	}
+}
+
+// TestEncodeAppend_ZeroOffsetIsValid proves the Offset field's zero
+// value round-trips cleanly. Until milestone 2 wires the leader-side
+// stamping, every command encoded by the broker carries Offset=0
+// and the FSM ignores it — so the zero value must not corrupt the
+// rest of the layout.
+func TestEncodeAppend_ZeroOffsetIsValid(t *testing.T) {
+	cmd := AppendCommand{
+		Topic:     "events",
+		Partition: 0,
+		Offset:    0,
+		Record:    proto.Record{Value: []byte("v")},
+	}
+	enc := EncodeAppend(cmd)
+	_, body, err := Decode(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeAppend(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Offset != 0 {
+		t.Errorf("Offset: got %d, want 0", got.Offset)
+	}
+	if !bytes.Equal(got.Record.Value, []byte("v")) {
+		t.Errorf("record value: got %q, want v", got.Record.Value)
 	}
 }
 

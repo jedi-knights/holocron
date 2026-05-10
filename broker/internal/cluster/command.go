@@ -38,9 +38,23 @@ const (
 )
 
 // AppendCommand is the FSM payload for an append.
+//
+// Offset is the broker-assigned offset the leader stamps before
+// submitting the command to Raft. Followers' FSMs read Offset
+// (rather than letting their local store.Append assign one) so a
+// fresh follower whose local store has been populated via the
+// Stage 9 segment-sync path can dedup Raft entries it already
+// holds — see docs/stage-9.md.
+//
+// Until milestone 2 wires leader-side stamping, every command
+// carries Offset=0 and the FSM ignores it (current behavior:
+// store.Append assigns the offset on every node). The wire field
+// is reserved by milestone 1 so the format change is backwards-
+// incompatible exactly once.
 type AppendCommand struct {
 	Topic     string
 	Partition int32
+	Offset    int64
 	Record    proto.Record
 }
 
@@ -55,13 +69,15 @@ type CreateTopicCommand struct {
 // EncodeAppend serializes an AppendCommand. Layout:
 //
 //	[1] kind = CmdAppend
-//	[2 + N] topic length + bytes
+//	[4 + N] topic length + bytes
 //	[4] partition (int32 BE)
+//	[8] offset (int64 BE)
 //	[record body — wire-format proto.Record minus its frame]
 func EncodeAppend(c AppendCommand) []byte {
 	buf := []byte{byte(CmdAppend)}
 	buf = appendString(buf, c.Topic)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(c.Partition))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(c.Offset))
 	rec := proto.ProduceRequest{Topic: c.Topic, Partition: c.Partition, Record: c.Record}.Encode()
 	// ProduceRequest.Encode embeds topic+partition+record; for the FSM we
 	// only need the record bytes, but reusing the encoder keeps the format
@@ -151,16 +167,17 @@ func DecodeAppend(body []byte) (AppendCommand, error) {
 		return AppendCommand{}, fmt.Errorf("cluster: append topic: %w", err)
 	}
 	body = body[n:]
-	if len(body) < 4 {
+	if len(body) < 12 {
 		return AppendCommand{}, errors.New("cluster: short append command")
 	}
-	partition := int32(binary.BigEndian.Uint32(body[:4]))
-	body = body[4:]
+	partition := int32(binary.BigEndian.Uint32(body[0:4]))
+	offset := int64(binary.BigEndian.Uint64(body[4:12]))
+	body = body[12:]
 	req, err := proto.DecodeProduceRequest(body)
 	if err != nil {
 		return AppendCommand{}, fmt.Errorf("cluster: append record: %w", err)
 	}
-	return AppendCommand{Topic: topic, Partition: partition, Record: req.Record}, nil
+	return AppendCommand{Topic: topic, Partition: partition, Offset: offset, Record: req.Record}, nil
 }
 
 // DecodeCreateTopic parses a CreateTopicCommand body.
