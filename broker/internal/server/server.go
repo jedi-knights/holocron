@@ -72,100 +72,6 @@ type Server struct {
 	authorizer    auth.Authorizer         // gates per-op actions; defaults to AllowAllAuthorizer
 	produceQuotas map[string]*tokenBucket // per-Principal-Subject produce limiter
 	fetchQuotas   map[string]*tokenBucket // per-Principal-Subject fetch limiter
-	acls          map[string]aclEntry     // per-Principal-Subject authorization (legacy WithACL path; PR 4 retires)
-}
-
-// ACL is the public-facing per-key authorization table. Produce and
-// Consume each list the topics the API key may publish to or read
-// from. A list containing the single element "*" grants the
-// permission on every topic; an empty list denies all.
-type ACL struct {
-	Produce []string
-	Consume []string
-}
-
-// aclEntry is the indexed form the server matches against on every
-// authenticated request. Topic membership uses sets for O(1)
-// look-ups; the wildcard flag short-circuits the set check.
-type aclEntry struct {
-	produceAll bool
-	consumeAll bool
-	produce    map[string]struct{}
-	consume    map[string]struct{}
-}
-
-// SetACL installs per-API-key authorization. Existing connections
-// pick up the new policy on their next request. An empty map clears
-// every restriction (default — no authorization, only authentication
-// applies).
-func (s *Server) SetACL(acls map[string]ACL) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(acls) == 0 {
-		s.acls = nil
-		return
-	}
-	s.acls = make(map[string]aclEntry, len(acls))
-	for key, entry := range acls {
-		ae := aclEntry{
-			produce: make(map[string]struct{}, len(entry.Produce)),
-			consume: make(map[string]struct{}, len(entry.Consume)),
-		}
-		for _, t := range entry.Produce {
-			if t == "*" {
-				ae.produceAll = true
-				continue
-			}
-			ae.produce[t] = struct{}{}
-		}
-		for _, t := range entry.Consume {
-			if t == "*" {
-				ae.consumeAll = true
-				continue
-			}
-			ae.consume[t] = struct{}{}
-		}
-		s.acls[key] = ae
-	}
-}
-
-// authorizeProduce returns true when apiKey may publish to topic.
-// When no ACL is configured (the default), authorization is open —
-// only authentication gates access.
-func (s *Server) authorizeProduce(apiKey, topic string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.acls == nil {
-		return true
-	}
-	entry, ok := s.acls[apiKey]
-	if !ok {
-		return false
-	}
-	if entry.produceAll {
-		return true
-	}
-	_, ok = entry.produce[topic]
-	return ok
-}
-
-// authorizeConsume returns true when apiKey may read from topic.
-// Same rules as authorizeProduce.
-func (s *Server) authorizeConsume(apiKey, topic string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.acls == nil {
-		return true
-	}
-	entry, ok := s.acls[apiKey]
-	if !ok {
-		return false
-	}
-	if entry.consumeAll {
-		return true
-	}
-	_, ok = entry.consume[topic]
-	return ok
 }
 
 // Quota configures a per-API-key bandwidth limit. Produce quotas count
@@ -552,12 +458,6 @@ func (s *Server) handleProduce(p auth.Principal, body []byte, w io.Writer) error
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpProduce, proto.StatusInvalidRequest, err.Error())
 	}
-	// Legacy WithACL check (PR 4 retires the path). Then the new
-	// scope-based authorizer — both must allow.
-	if !s.authorizeProduce(p.Subject, req.Topic) {
-		return proto.WriteErrorResponse(w, proto.OpProduce, proto.StatusForbidden,
-			fmt.Sprintf("not authorized to produce to %q", req.Topic))
-	}
 	if err := s.authorize(p, auth.ActionProduce, req.Topic); err != nil {
 		return proto.WriteErrorResponse(w, proto.OpProduce, proto.StatusForbidden, err.Error())
 	}
@@ -592,10 +492,6 @@ func (s *Server) handleFetch(p auth.Principal, body []byte, w io.Writer) error {
 	req, err := proto.DecodeFetchRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpFetch, proto.StatusInvalidRequest, err.Error())
-	}
-	if !s.authorizeConsume(p.Subject, req.Topic) {
-		return proto.WriteErrorResponse(w, proto.OpFetch, proto.StatusForbidden,
-			fmt.Sprintf("not authorized to consume from %q", req.Topic))
 	}
 	if err := s.authorize(p, auth.ActionConsume, req.Topic); err != nil {
 		return proto.WriteErrorResponse(w, proto.OpFetch, proto.StatusForbidden, err.Error())
@@ -1047,10 +943,6 @@ func (s *Server) handleProduceBatch(p auth.Principal, body []byte, w io.Writer) 
 	req, err := proto.DecodeProduceBatchRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpProduceBatch, proto.StatusInvalidRequest, err.Error())
-	}
-	if !s.authorizeProduce(p.Subject, req.Topic) {
-		return proto.WriteErrorResponse(w, proto.OpProduceBatch, proto.StatusForbidden,
-			fmt.Sprintf("not authorized to produce to %q", req.Topic))
 	}
 	if err := s.authorize(p, auth.ActionProduce, req.Topic); err != nil {
 		return proto.WriteErrorResponse(w, proto.OpProduceBatch, proto.StatusForbidden, err.Error())
