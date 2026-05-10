@@ -7,8 +7,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jedi-knights/holocron/broker/embed"
+	"github.com/jedi-knights/holocron/broker/internal/auth"
 	"github.com/jedi-knights/holocron/broker/internal/tlsconfig"
 )
 
@@ -52,6 +57,8 @@ func run(args []string) error {
 	clusterTLSKey := fs.String("cluster-tls-key", envOrDefault("HOLOCRON_CLUSTER_TLS_KEY", ""), "PEM private key matching --cluster-tls-cert")
 	clusterTLSCA := fs.String("cluster-tls-ca", envOrDefault("HOLOCRON_CLUSTER_TLS_CA", ""), "PEM CA bundle that signs every peer's cert; used for both inbound and outbound verification")
 	clusterTLSServerName := fs.String("cluster-tls-server-name", envOrDefault("HOLOCRON_CLUSTER_TLS_SERVER_NAME", ""), "expected SAN on peer certs when dialing (override only when peer certs do not carry their bind addresses)")
+	authIssuerKey := fs.String("auth-issuer-key", envOrDefault("HOLOCRON_AUTH_ISSUER_KEY", ""), "PEM-encoded Ed25519 public key (PKIX) — presence enables JWT-required auth on the wire listener")
+	authDenylist := fs.String("auth-denylist", envOrDefault("HOLOCRON_AUTH_DENYLIST", ""), "path to a denylist file (one subject per line); reloaded on SIGHUP")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -70,6 +77,14 @@ func run(args []string) error {
 	}
 	if clusterTLSCfg != nil && !*clusterMode {
 		return errors.New("--cluster-tls-* flags require --cluster (cluster TLS protects the Raft transport, which only runs in cluster mode)")
+	}
+
+	authVerifier, denylist, err := loadAuthVerifier(*authIssuerKey, *authDenylist)
+	if err != nil {
+		return err
+	}
+	if authVerifier != nil && *listen == "" {
+		return errors.New("--auth-issuer-key requires --listen (auth applies to the wire listener; it cannot be configured without one)")
 	}
 
 	fmt.Printf("holocrond — stage %s\n", stage)
@@ -130,14 +145,36 @@ func run(args []string) error {
 		if tlsCfg != nil {
 			listenOpts = append(listenOpts, embed.WithTLS(tlsCfg))
 		}
+		if authVerifier != nil {
+			listenOpts = append(listenOpts, embed.WithAuthVerifier(authVerifier))
+		}
 		addr, err := b.Listen(*listen, listenOpts...)
 		if err != nil {
 			_ = b.Close()
 			return fmt.Errorf("listen: %w", err)
 		}
-		fmt.Printf("listening on %s (wire v%d, %s)\n", addr, 1, wireSchemeDescription(tlsCfg))
+		fmt.Printf("listening on %s (wire v%d, %s, auth=%s)\n", addr, 1, wireSchemeDescription(tlsCfg), authSchemeDescription(authVerifier))
 	} else {
 		fmt.Println("broker ready (network listener disabled)")
+	}
+
+	// SIGHUP reloads the denylist file in place. The verifier holds
+	// the *MemoryDenyList by interface, so a successful Set call is
+	// visible to every subsequent Verify with no broker restart.
+	if denylist != nil && *authDenylist != "" {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				subjects, err := readDenylistFile(*authDenylist)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "holocrond: SIGHUP denylist reload failed: %v\n", err)
+					continue
+				}
+				denylist.Set(subjects)
+				fmt.Printf("holocrond: denylist reloaded (%d entries)\n", len(subjects))
+			}
+		}()
 	}
 	fmt.Println("press Ctrl-C to exit")
 
@@ -218,6 +255,109 @@ func loadClusterTLS(cert, key, ca, serverName string) (*tls.Config, error) {
 		cfg.ServerName = serverName
 	}
 	return cfg, nil
+}
+
+// loadAuthVerifier returns an auth.TokenVerifier and (when applicable)
+// the *MemoryDenyList backing it, derived from the daemon's --auth-*
+// flags. Returns (nil, nil, nil) when no auth flag is set —
+// AnonymousVerifier remains the default.
+//
+// Validation rules:
+//   - --auth-denylist without --auth-issuer-key is rejected (a
+//     denylist needs a verifier to attach to; AnonymousVerifier
+//     ignores its credential).
+//   - --auth-issuer-key must point at a PEM-encoded PKIX Ed25519
+//     public key — exactly the format `openssl genpkey -algorithm
+//     Ed25519` produces (its public-key counterpart).
+func loadAuthVerifier(issuerKeyPath, denylistPath string) (auth.TokenVerifier, *auth.MemoryDenyList, error) {
+	if issuerKeyPath == "" && denylistPath == "" {
+		return nil, nil, nil
+	}
+	if issuerKeyPath == "" {
+		return nil, nil, errors.New("--auth-denylist requires --auth-issuer-key (a denylist has nothing to attach to without a verifier)")
+	}
+
+	pubKey, err := loadEd25519PublicKey(issuerKeyPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	opts := []auth.Ed25519VerifierOption{}
+	var denylist *auth.MemoryDenyList
+	if denylistPath != "" {
+		subjects, err := readDenylistFile(denylistPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		denylist = auth.NewMemoryDenyList(subjects...)
+		opts = append(opts, auth.WithDenyList(denylist))
+	}
+	return auth.NewEd25519Verifier(pubKey, opts...), denylist, nil
+}
+
+// loadEd25519PublicKey parses a PEM-encoded PKIX Ed25519 public key
+// from path. Any other algorithm (RSA, ECDSA) is rejected.
+func loadEd25519PublicKey(path string) (ed25519.PublicKey, error) {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("--auth-issuer-key %q: %w", path, err)
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, fmt.Errorf("--auth-issuer-key %q: contains no PEM block", path)
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("--auth-issuer-key %q: parse PKIX: %w", path, err)
+	}
+	ed, ok := pub.(ed25519.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("--auth-issuer-key %q: expected Ed25519 public key, got %T", path, pub)
+	}
+	return ed, nil
+}
+
+// readDenylistFile reads subject IDs from a denylist file, one per
+// line. Blank lines and lines beginning with `#` are skipped so an
+// operator can annotate entries with the reason or ticket number.
+func readDenylistFile(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("--auth-denylist %q: %w", path, err)
+	}
+	defer f.Close()
+
+	var subjects []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		subjects = append(subjects, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("--auth-denylist %q: %w", path, err)
+	}
+	return subjects, nil
+}
+
+// authSchemeDescription summarises the wire-listener auth posture for
+// the startup banner: "anonymous" when no verifier is configured,
+// "jwt" when the Ed25519 verifier is in place. Future verifiers
+// (mTLS-CN, OIDC) extend this map.
+func authSchemeDescription(v auth.TokenVerifier) string {
+	if v == nil {
+		return "anonymous"
+	}
+	switch v.(type) {
+	case *auth.Ed25519Verifier:
+		return "jwt"
+	case *auth.APIKeyVerifier:
+		return "api-key"
+	default:
+		return "configured"
+	}
 }
 
 // parseTLSVersion maps the operator-facing "1.2" / "1.3" string to the
