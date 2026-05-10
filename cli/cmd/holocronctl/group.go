@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
 )
 
@@ -42,11 +43,16 @@ func runGroupList(args []string) error {
 	apiKey := fs.String("api-key", "", "API key for handshake (empty = no auth)")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -82,6 +88,7 @@ func runGroupDescribe(args []string) error {
 	group := fs.String("group", "", "group name (required)")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -89,7 +96,11 @@ func runGroupDescribe(args []string) error {
 		return errors.New("group describe: --group is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -132,6 +143,7 @@ func runGroupOffsets(args []string) error {
 	group := fs.String("group", "", "group name (required)")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -139,7 +151,11 @@ func runGroupOffsets(args []string) error {
 		return errors.New("group offsets: --group is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -197,6 +213,7 @@ func runGroupDelete(args []string) error {
 	apiKey := fs.String("api-key", "", "API key for handshake")
 	group := fs.String("group", "", "group name (required)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -204,7 +221,11 @@ func runGroupDelete(args []string) error {
 		return errors.New("group delete: --group is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -235,6 +256,7 @@ func runGroupResetAll(args []string) error {
 	group := fs.String("group", "", "group name (required)")
 	to := fs.String("to", "", "earliest | latest (required)")
 	timeout := fs.Duration("timeout", 10*time.Second, "RPC timeout (covers all partitions)")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -245,7 +267,11 @@ func runGroupResetAll(args []string) error {
 		return errors.New("group reset-all: --to must be earliest or latest")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -292,6 +318,7 @@ func runGroupRename(args []string) error {
 	oldName := fs.String("old", "", "current group name (required)")
 	newName := fs.String("new", "", "new group name (required)")
 	timeout := fs.Duration("timeout", 10*time.Second, "RPC timeout (covers the full rename)")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -302,7 +329,11 @@ func runGroupRename(args []string) error {
 		return errors.New("group rename: --old and --new must differ")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}

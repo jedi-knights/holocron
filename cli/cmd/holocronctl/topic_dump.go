@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
 	"github.com/jedi-knights/holocron/sdk"
 )
@@ -55,6 +56,7 @@ func runTopicDump(args []string) error {
 	partition := fs.Int("partition", 0, "partition index")
 	file := fs.String("file", "", "output file path (omit for stdout)")
 	timeout := fs.Duration("timeout", 30*time.Second, "RPC timeout (covers the full dump)")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -62,7 +64,11 @@ func runTopicDump(args []string) error {
 		return errors.New("topic dump: --topic is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}

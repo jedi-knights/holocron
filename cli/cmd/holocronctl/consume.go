@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
 	"github.com/jedi-knights/holocron/sdk"
 )
@@ -30,6 +31,7 @@ func runTail(args []string) error {
 	max := fs.Int("max", 0, "stop after N records (0 = run until --duration elapses)")
 	jsonOut := fs.Bool("json", false, "emit each record as JSONL (same shape as topic dump)")
 	duration := fs.Duration("duration", 30*time.Second, "max time to wait")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -37,7 +39,11 @@ func runTail(args []string) error {
 		return errors.New("tail: --topic is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -107,6 +113,7 @@ func runConsume(args []string) error {
 	max := fs.Int("max", 0, "stop after N records (0 = run until --duration elapses or ctrl-c)")
 	jsonOut := fs.Bool("json", false, "emit each record as JSONL (same shape as topic dump)")
 	duration := fs.Duration("duration", 10*time.Second, "max time to wait")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -114,7 +121,11 @@ func runConsume(args []string) error {
 		return errors.New("consume: --topic is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}

@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
 	"github.com/jedi-knights/holocron/sdk"
 )
@@ -33,6 +34,7 @@ func runTopicLoad(args []string) error {
 	file := fs.String("file", "", "input JSONL file path (required; format produced by topic dump)")
 	batch := fs.Bool("batch", false, "ship every record as one SendBatch instead of N Sends (faster for bulk imports)")
 	timeout := fs.Duration("timeout", 30*time.Second, "RPC timeout (covers the full load)")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -40,7 +42,11 @@ func runTopicLoad(args []string) error {
 		return errors.New("topic load: --topic and --file are required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}

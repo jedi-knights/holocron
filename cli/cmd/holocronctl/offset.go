@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
 )
 
@@ -39,6 +40,7 @@ func runOffsetCommit(args []string) error {
 	partition := fs.Int("partition", 0, "partition index")
 	offset := fs.Int64("offset", -1, "committed offset (next-to-read)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -46,7 +48,11 @@ func runOffsetCommit(args []string) error {
 		return errors.New("offset commit: --group, --topic, and --offset (>= 0) are required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -73,6 +79,7 @@ func runOffsetReset(args []string) error {
 	topic := fs.String("topic", "", "topic name (required)")
 	partition := fs.Int("partition", 0, "partition index")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -80,7 +87,11 @@ func runOffsetReset(args []string) error {
 		return errors.New("offset reset: --group and --topic are required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}

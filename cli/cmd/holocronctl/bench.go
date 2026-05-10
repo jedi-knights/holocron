@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
 	"github.com/jedi-knights/holocron/sdk"
 )
@@ -36,6 +37,7 @@ func runBench(args []string) error {
 	fromOffset := fs.Int64("from-offset", 0, "consume mode: starting offset")
 	pollSize := fs.Int("poll-size", 256, "consume mode: max records per Poll call")
 	timeout := fs.Duration("timeout", 60*time.Second, "overall run timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -52,7 +54,11 @@ func runBench(args []string) error {
 		return errors.New("bench: --producer-count must be > 0")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -100,7 +106,7 @@ func runBench(args []string) error {
 			// Each producer dials its own connection so the
 			// concurrent load actually parallelizes on the wire
 			// rather than serializing through one socket.
-			myTr, err := dial(*addr, *apiKey)
+			myTr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 			if err != nil {
 				results[idx] = producerResult{err: fmt.Errorf("producer %d dial: %w", idx, err)}
 				return

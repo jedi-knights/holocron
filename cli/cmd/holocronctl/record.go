@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
 	"github.com/jedi-knights/holocron/sdk"
 )
@@ -37,6 +38,7 @@ func runRecordFetch(args []string) error {
 	offset := fs.Int64("offset", -1, "record offset (>= 0, required)")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON (same shape as topic dump)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -44,7 +46,11 @@ func runRecordFetch(args []string) error {
 		return errors.New("record fetch: --topic and --offset (>= 0) are required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}

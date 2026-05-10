@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"time"
 
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
 	holocronnet "github.com/jedi-knights/holocron/sdk/net"
 )
@@ -57,6 +59,7 @@ func runTopicStats(args []string) error {
 	allTopics := fs.Bool("all-topics", false, "report stats for every topic in the registry")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -64,7 +67,11 @@ func runTopicStats(args []string) error {
 		return errors.New("topic stats: --topic is required (or pass --all-topics)")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -159,6 +166,7 @@ func runTopicUpdate(args []string) error {
 	retentionMs := fs.Int64("retention-ms", 0, "new retention in ms (0 = no change)")
 	segmentBytes := fs.Int64("segment-bytes", 0, "new segment size in bytes (0 = no change)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -169,7 +177,11 @@ func runTopicUpdate(args []string) error {
 		return errors.New("topic update: at least one of --retention-ms / --segment-bytes is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -201,6 +213,7 @@ func runTopicDescribe(args []string) error {
 	name := fs.String("topic", "", "topic name (required)")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -208,7 +221,11 @@ func runTopicDescribe(args []string) error {
 		return errors.New("topic describe: --topic is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -254,6 +271,7 @@ func runTopicDelete(args []string) error {
 	apiKey := fs.String("api-key", "", "API key for handshake (empty = no auth)")
 	name := fs.String("topic", "", "topic name (required)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -261,7 +279,11 @@ func runTopicDelete(args []string) error {
 		return errors.New("topic delete: --topic is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -283,6 +305,7 @@ func runTopicCreate(args []string) error {
 	name := fs.String("topic", "", "topic name (required)")
 	partitions := fs.Int("partitions", 1, "partition count")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -290,7 +313,11 @@ func runTopicCreate(args []string) error {
 		return errors.New("topic create: --topic is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -311,11 +338,16 @@ func runTopicList(args []string) error {
 	apiKey := fs.String("api-key", "", "API key for handshake")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -340,11 +372,23 @@ func runTopicList(args []string) error {
 	return nil
 }
 
-// dial opens a network transport with optional API-key auth. The
-// CLI's shared connection helper.
-func dial(addr, apiKey string) (*holocronnet.Transport, error) {
+// dial opens a network transport with optional API-key auth and any
+// extra options supplied by the caller — typically holocronnet.WithTLS
+// from the per-subcommand TLS flag closure.
+func dial(addr, apiKey string, extra ...holocronnet.Option) (*holocronnet.Transport, error) {
+	opts := append([]holocronnet.Option(nil), extra...)
 	if apiKey != "" {
-		return holocronnet.Dial(addr, holocronnet.WithAPIKey(apiKey))
+		opts = append(opts, holocronnet.WithAPIKey(apiKey))
 	}
-	return holocronnet.Dial(addr)
+	return holocronnet.Dial(addr, opts...)
+}
+
+// dialOpts converts a *tls.Config (which may be nil) into the slice of
+// holocronnet.Option values dial expects. Returns an empty slice when
+// the config is nil so callers can spread it unconditionally.
+func dialOpts(tlsCfg *tls.Config) []holocronnet.Option {
+	if tlsCfg == nil {
+		return nil
+	}
+	return []holocronnet.Option{holocronnet.WithTLS(tlsCfg)}
 }

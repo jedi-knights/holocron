@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 	"github.com/jedi-knights/holocron/proto"
 	"github.com/jedi-knights/holocron/sdk"
 )
@@ -33,6 +34,7 @@ func runTopicCopy(args []string) error {
 	partition := fs.Int("partition", 0, "source partition index (ignored with --all-partitions)")
 	allPartitions := fs.Bool("all-partitions", false, "copy every partition of source instead of just one")
 	timeout := fs.Duration("timeout", 30*time.Second, "RPC timeout (covers the full copy)")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -43,7 +45,11 @@ func runTopicCopy(args []string) error {
 		return errors.New("topic copy: --from and --to must differ")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
