@@ -81,10 +81,10 @@ func TestHTTPSource_CursorAdvancesAndPersists(t *testing.T) {
 	// Arrange — server returns batch-{n} text and X-Next-Cursor=batch-{n+1}
 	// keyed off the `?since` query param.
 	pages := map[string]string{
-		"":         "alpha\n",
-		"page-1":   "bravo\n",
-		"page-2":   "charlie\n",
-		"page-3":   "",
+		"":       "alpha\n",
+		"page-1": "bravo\n",
+		"page-2": "charlie\n",
+		"page-3": "",
 	}
 	nextOf := map[string]string{
 		"":       "page-1",

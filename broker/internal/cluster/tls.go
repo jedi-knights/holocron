@@ -20,9 +20,9 @@ import (
 // inbound peers must present a matching cert too — which is the
 // recommended setup for a closed cluster).
 type tlsStreamLayer struct {
-	listener net.Listener
+	listener  net.Listener
 	advertise net.Addr
-	cfg      *tls.Config
+	cfg       *tls.Config
 }
 
 // newTLSStreamLayer binds a TLS-wrapped TCP listener at bindAddr and

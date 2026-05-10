@@ -79,4 +79,3 @@ func TestIndex_ReadMissingFileReturnsEmpty(t *testing.T) {
 		t.Fatalf("got %d entries, want 0", len(got.entries))
 	}
 }
-

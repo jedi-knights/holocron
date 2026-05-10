@@ -103,17 +103,17 @@ type Worker struct {
 	transport   sdk.Transport
 	offsetStore OffsetStore
 
-	mu             sync.Mutex
-	sources        []sourceMount
-	sinks          []sinkMount
-	running        bool
-	stopFunc       context.CancelFunc
-	runCtx         context.Context // valid while running; used by AddSourceLive
-	producer       *sdk.Producer   // valid while running
-	mountCancels   map[string]context.CancelFunc // connector name → per-mount cancel
-	wg             sync.WaitGroup
-	errs           []error
-	errsMu         sync.Mutex
+	mu           sync.Mutex
+	sources      []sourceMount
+	sinks        []sinkMount
+	running      bool
+	stopFunc     context.CancelFunc
+	runCtx       context.Context               // valid while running; used by AddSourceLive
+	producer     *sdk.Producer                 // valid while running
+	mountCancels map[string]context.CancelFunc // connector name → per-mount cancel
+	wg           sync.WaitGroup
+	errs         []error
+	errsMu       sync.Mutex
 
 	statsMu sync.Mutex
 	stats   map[string]*taskStatCounters // key = connector|index

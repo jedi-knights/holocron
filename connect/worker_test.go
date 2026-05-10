@@ -173,10 +173,12 @@ type flakySink struct {
 	mu        sync.Mutex
 }
 
-func (s *flakySink) Name() string                                              { return s.name }
-func (s *flakySink) Topics() []string                                          { return s.topics }
-func (s *flakySink) Tasks(maxTasks int) ([]connect.SinkTask, error)            { return []connect.SinkTask{s}, nil }
-func (s *flakySink) Init(_ context.Context) error                              { return nil }
+func (s *flakySink) Name() string     { return s.name }
+func (s *flakySink) Topics() []string { return s.topics }
+func (s *flakySink) Tasks(maxTasks int) ([]connect.SinkTask, error) {
+	return []connect.SinkTask{s}, nil
+}
+func (s *flakySink) Init(_ context.Context) error { return nil }
 func (s *flakySink) Put(_ context.Context, records []proto.Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -196,13 +198,17 @@ type alwaysFailSink struct {
 	topics []string
 }
 
-func (s *alwaysFailSink) Name() string                                       { return s.name }
-func (s *alwaysFailSink) Topics() []string                                   { return s.topics }
-func (s *alwaysFailSink) Tasks(maxTasks int) ([]connect.SinkTask, error)     { return []connect.SinkTask{s}, nil }
-func (s *alwaysFailSink) Init(_ context.Context) error                       { return nil }
-func (s *alwaysFailSink) Put(_ context.Context, _ []proto.Record) error      { return errors.New("permanent failure") }
-func (s *alwaysFailSink) Flush(_ context.Context) error                      { return nil }
-func (s *alwaysFailSink) Close() error                                       { return nil }
+func (s *alwaysFailSink) Name() string     { return s.name }
+func (s *alwaysFailSink) Topics() []string { return s.topics }
+func (s *alwaysFailSink) Tasks(maxTasks int) ([]connect.SinkTask, error) {
+	return []connect.SinkTask{s}, nil
+}
+func (s *alwaysFailSink) Init(_ context.Context) error { return nil }
+func (s *alwaysFailSink) Put(_ context.Context, _ []proto.Record) error {
+	return errors.New("permanent failure")
+}
+func (s *alwaysFailSink) Flush(_ context.Context) error { return nil }
+func (s *alwaysFailSink) Close() error                  { return nil }
 
 func TestWorker_SinkRetrySucceedsAfterTransientFailure(t *testing.T) {
 	// Arrange
@@ -492,7 +498,6 @@ type gatedSource struct {
 	name  string
 	topic string
 	gate  <-chan struct{}
-	once  *sync.Once
 	emits []string
 
 	emitted *atomicBool
@@ -552,7 +557,7 @@ func (t *gatedSourceTask) Poll(ctx context.Context) ([]connect.SourceRecord, err
 	return out, nil
 }
 func (t *gatedSourceTask) Commit(_ context.Context, _ []connect.SourceRecord) error { return nil }
-func (t *gatedSourceTask) Close() error                                              { return nil }
+func (t *gatedSourceTask) Close() error                                             { return nil }
 
 // TestWorker_CoordinatedSource_NoDoubleProduction proves WithSourceCoordTopic
 // elects a single owner across a worker pool. Two workers register the

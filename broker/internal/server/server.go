@@ -62,11 +62,11 @@ type Server struct {
 	ctx       context.Context
 	cancelCtx context.CancelFunc
 
-	mu       sync.Mutex
-	listener net.Listener
-	conns    map[net.Conn]struct{}
-	closing  bool
-	wg       sync.WaitGroup
+	mu            sync.Mutex
+	listener      net.Listener
+	conns         map[net.Conn]struct{}
+	closing       bool
+	wg            sync.WaitGroup
 	apiKeys       map[string]struct{}
 	produceQuotas map[string]*tokenBucket // per-API-key produce limiter
 	fetchQuotas   map[string]*tokenBucket // per-API-key fetch limiter

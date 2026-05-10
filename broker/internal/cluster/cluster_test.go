@@ -388,7 +388,7 @@ func TestFSM_SnapshotRestoreRebuildsRegistry(t *testing.T) {
 
 // memSink is a zero-config raft.SnapshotSink for tests.
 type memSink struct {
-	buf      []byte
+	buf       []byte
 	cancelled bool
 	closed    bool
 }
@@ -397,10 +397,10 @@ func (s *memSink) Write(p []byte) (int, error) {
 	s.buf = append(s.buf, p...)
 	return len(p), nil
 }
-func (s *memSink) Close() error          { s.closed = true; return nil }
-func (s *memSink) Cancel() error         { s.cancelled = true; return nil }
-func (s *memSink) ID() string            { return "test-sink" }
-func (s *memSink) bytes() []byte         { return s.buf }
+func (s *memSink) Close() error  { s.closed = true; return nil }
+func (s *memSink) Cancel() error { s.cancelled = true; return nil }
+func (s *memSink) ID() string    { return "test-sink" }
+func (s *memSink) bytes() []byte { return s.buf }
 
 // raftTLSConfig builds a self-signed cert + matching tls.Config that
 // works for both Listen and Dial against 127.0.0.1. Used to drive the

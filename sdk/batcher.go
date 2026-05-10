@@ -20,11 +20,11 @@ type batcher struct {
 	producer *Producer
 	pref     proto.PartitionRef
 
-	mu       sync.Mutex
-	pending  []proto.Record
-	results  []chan batchResult
-	timer    *time.Timer
-	closed   bool
+	mu      sync.Mutex
+	pending []proto.Record
+	results []chan batchResult
+	timer   *time.Timer
+	closed  bool
 }
 
 type batchResult struct {

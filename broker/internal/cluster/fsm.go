@@ -27,8 +27,7 @@ type FSM struct {
 	store    storage.Store
 	registry *topic.Registry
 
-	mu     sync.RWMutex
-	closed bool
+	mu sync.RWMutex
 }
 
 // NewFSM returns an FSM bound to the given store and registry.

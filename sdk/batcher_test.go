@@ -86,7 +86,7 @@ func (t *recordingTransport) JoinGroup(_ context.Context, _, _ string, _ []strin
 func (t *recordingTransport) Heartbeat(_ context.Context, _, _ string, _ int32, _ time.Duration) (sdk.HeartbeatResult, error) {
 	return sdk.HeartbeatResult{}, nil
 }
-func (t *recordingTransport) LeaveGroup(_ context.Context, _, _ string) error { return nil }
+func (t *recordingTransport) LeaveGroup(_ context.Context, _, _ string) error    { return nil }
 func (t *recordingTransport) Sync(_ context.Context, _ proto.PartitionRef) error { return nil }
 func (t *recordingTransport) Close() error                                       { return nil }
 

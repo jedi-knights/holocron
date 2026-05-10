@@ -51,21 +51,21 @@ const WireVersion uint8 = 9
 type OpCode uint8
 
 const (
-	OpProduce      OpCode = 0x01
-	OpFetch        OpCode = 0x02
-	OpMetadata     OpCode = 0x03
-	OpCreateTopic  OpCode = 0x04
-	OpCommit       OpCode = 0x05
-	OpHandshake    OpCode = 0x06
-	OpJoinGroup    OpCode = 0x07
-	OpHeartbeat    OpCode = 0x08
-	OpLeaveGroup   OpCode = 0x09
-	OpSync         OpCode = 0x0A
-	OpProduceBatch    OpCode = 0x0B
-	OpHighWater       OpCode = 0x0C
-	OpClusterMembers  OpCode = 0x0D
-	OpAddVoter        OpCode = 0x0E
-	OpRemoveVoter     OpCode = 0x0F
+	OpProduce        OpCode = 0x01
+	OpFetch          OpCode = 0x02
+	OpMetadata       OpCode = 0x03
+	OpCreateTopic    OpCode = 0x04
+	OpCommit         OpCode = 0x05
+	OpHandshake      OpCode = 0x06
+	OpJoinGroup      OpCode = 0x07
+	OpHeartbeat      OpCode = 0x08
+	OpLeaveGroup     OpCode = 0x09
+	OpSync           OpCode = 0x0A
+	OpProduceBatch   OpCode = 0x0B
+	OpHighWater      OpCode = 0x0C
+	OpClusterMembers OpCode = 0x0D
+	OpAddVoter       OpCode = 0x0E
+	OpRemoveVoter    OpCode = 0x0F
 	// OpListSegments returns metadata for every segment in a
 	// partition — base offset and current (.log, .idx) sizes —
 	// captured under the partition's mutex so subsequent
@@ -852,7 +852,7 @@ type ClusterMember struct {
 // current Raft configuration. Routed locally — any node can serve it.
 type ClusterMembersRequest struct{}
 
-func (ClusterMembersRequest) Encode() []byte                        { return nil }
+func (ClusterMembersRequest) Encode() []byte { return nil }
 func DecodeClusterMembersRequest(_ []byte) (ClusterMembersRequest, error) {
 	return ClusterMembersRequest{}, nil
 }

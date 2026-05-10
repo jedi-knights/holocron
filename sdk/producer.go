@@ -102,24 +102,24 @@ const (
 // producer flushes the batch as one ProduceBatch RPC. Send returns
 // after the batch has been sent (and ack'd if AcksDurable is set).
 type Producer struct {
-	transport     Transport
-	partitioner   Partitioner
-	acks          Acks
-	linger        time.Duration
-	batchSize     int
-	codec         proto.Codec
-	codecLevel    uint8 // LZ4 level: 0 = fast, 1..9 = HC at that level
+	transport   Transport
+	partitioner Partitioner
+	acks        Acks
+	linger      time.Duration
+	batchSize   int
+	codec       proto.Codec
+	codecLevel  uint8 // LZ4 level: 0 = fast, 1..9 = HC at that level
 	// inFlight is a semaphore bounding concurrent SendNoWait
 	// publishes when WithMaxInFlight is set. nil means unbounded
 	// (the default).
-	inFlight chan struct{}
-	rateLimitTries int                    // 0 disables retry; 1+ retries per Send
-	rateLimitWait  time.Duration          // base wait between retry attempts
-	retryStatuses  map[proto.Status]bool  // additional statuses that trigger retry
-	idempotent     bool             // producer stamps records for broker dedup
-	producerID     string           // unique to this Producer instance
-	onSent         []SentHook       // fired after each successful Send / SendBatch
-	onAsyncError   []AsyncErrorHook // fired per failed SendNoWait record
+	inFlight       chan struct{}
+	rateLimitTries int                   // 0 disables retry; 1+ retries per Send
+	rateLimitWait  time.Duration         // base wait between retry attempts
+	retryStatuses  map[proto.Status]bool // additional statuses that trigger retry
+	idempotent     bool                  // producer stamps records for broker dedup
+	producerID     string                // unique to this Producer instance
+	onSent         []SentHook            // fired after each successful Send / SendBatch
+	onAsyncError   []AsyncErrorHook      // fired per failed SendNoWait record
 
 	mu     sync.Mutex
 	closed bool
@@ -455,7 +455,6 @@ func (p *Producer) shouldRetry(err error) bool {
 	}
 	return p.retryStatuses[pe.Status]
 }
-
 
 // backoff computes the wait duration for attempt n, doubling each time
 // and capping at 8x base.

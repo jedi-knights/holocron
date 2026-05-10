@@ -40,10 +40,6 @@ const dedupTopic = "__holocron_dedup"
 // metadata across restarts.
 const topicsFileName = "topics.json"
 
-// offsetsFileName is the JSON file inside the data dir that persists
-// committed consumer-group offsets across restarts.
-const offsetsFileName = "offsets.json"
-
 // Broker is an in-process broker handle. It owns the storage backend, the
 // topic registry, and the pub/sub coordinator, and exposes the SDK
 // Transport that producers and consumers connect through.
@@ -98,12 +94,12 @@ func NewMemory() *Broker {
 type DiskOption func(*diskConfig)
 
 type diskConfig struct {
-	segmentBytes     int64
-	retention        time.Duration
-	retentionBytes   int64
-	retentionTickInt time.Duration
+	segmentBytes      int64
+	retention         time.Duration
+	retentionBytes    int64
+	retentionTickInt  time.Duration
 	compactionEnabled bool
-	cluster          *ClusterConfig
+	cluster           *ClusterConfig
 }
 
 // WithSegmentBytes sets the segment-rollover threshold (default 1 GiB).
@@ -214,9 +210,10 @@ func NewDisk(dir string, opts ...DiskOption) (*Broker, error) {
 	if cfg.cluster != nil {
 		fsm := cluster.NewFSM(store, registry)
 		peers := make([]cluster.Peer, 0, len(cfg.cluster.Peers))
-		for _, p := range cfg.cluster.Peers {
-			peers = append(peers, cluster.Peer{ID: p.ID, Addr: p.Addr, WireAddr: p.WireAddr})
-		}
+		// ClusterPeer is a type alias for cluster.Peer (line ~67), so
+		// the slice-to-slice copy is just an append on each element —
+		// no field-by-field reconstruction needed.
+		peers = append(peers, cfg.cluster.Peers...)
 		cl, err = cluster.New(cluster.Config{
 			NodeID:        cfg.cluster.NodeID,
 			BindAddr:      cfg.cluster.BindAddr,

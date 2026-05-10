@@ -30,7 +30,7 @@ type fakeClock struct {
 	t time.Time
 }
 
-func (f *fakeClock) Now() time.Time { return f.t }
+func (f *fakeClock) Now() time.Time          { return f.t }
 func (f *fakeClock) advance(d time.Duration) { f.t = f.t.Add(d) }
 
 func TestManager_SingleMemberGetsAllPartitions(t *testing.T) {

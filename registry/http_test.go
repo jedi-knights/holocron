@@ -357,7 +357,10 @@ func TestHTTP_ListSubjectsAndVersions(t *testing.T) {
 	_, _ = svc.Register(ctx, "a-value", `{"v":2}`)
 	_, _ = svc.Register(ctx, "b-value", `{"v":1}`)
 
-	resp, _ := http.Get(srv.URL + "/subjects")
+	resp, err := http.Get(srv.URL + "/subjects")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 	var subjects []string
 	if err := json.NewDecoder(resp.Body).Decode(&subjects); err != nil {
@@ -367,7 +370,10 @@ func TestHTTP_ListSubjectsAndVersions(t *testing.T) {
 		t.Fatalf("subjects=%v want 2", subjects)
 	}
 
-	resp, _ = http.Get(srv.URL + "/subjects/a-value/versions")
+	resp, err = http.Get(srv.URL + "/subjects/a-value/versions")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 	var versions []int
 	if err := json.NewDecoder(resp.Body).Decode(&versions); err != nil {
@@ -384,7 +390,10 @@ func TestHTTP_GetLatest(t *testing.T) {
 	_, _ = svc.Register(ctx, "x", `{"v":1}`)
 	_, _ = svc.Register(ctx, "x", `{"v":2}`)
 
-	resp, _ := http.Get(srv.URL + "/subjects/x/versions/latest")
+	resp, err := http.Get(srv.URL + "/subjects/x/versions/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 	var sc registry.Schema
 	if err := json.NewDecoder(resp.Body).Decode(&sc); err != nil {
@@ -397,7 +406,10 @@ func TestHTTP_GetLatest(t *testing.T) {
 
 func TestHTTP_NotFoundReturns404(t *testing.T) {
 	srv, _ := newHTTPHandler(t)
-	resp, _ := http.Get(srv.URL + "/subjects/nope/versions")
+	resp, err := http.Get(srv.URL + "/subjects/nope/versions")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status: got %d, want 404", resp.StatusCode)

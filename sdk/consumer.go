@@ -53,7 +53,7 @@ type Consumer struct {
 	heartbeatInterval  time.Duration
 	onRevoke           RevokeFunc
 	onAssign           AssignFunc
-	stickyMemberID     bool          // memberID was caller-supplied; skip LeaveGroup on Close
+	stickyMemberID     bool               // memberID was caller-supplied; skip LeaveGroup on Close
 	autoCommitInterval time.Duration      // 0 disables; >0 starts a tick goroutine in NewConsumer
 	autoCommitCancel   context.CancelFunc // stops the auto-commit goroutine on Close
 

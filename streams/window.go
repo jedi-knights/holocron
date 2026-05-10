@@ -347,4 +347,3 @@ func DecodeWindowTime(b []byte) int64 {
 	}
 	return int64(binary.BigEndian.Uint64(b))
 }
-

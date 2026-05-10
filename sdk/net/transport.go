@@ -10,11 +10,11 @@ package net
 import (
 	"bufio"
 	"context"
-	"errors"
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"strings"
 	stdnet "net"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,12 +39,12 @@ type Transport struct {
 	tlsConfig   *tls.Config
 	apiKey      string
 
-	mu           sync.Mutex
-	rpc          *connection // shared connection for unary RPCs (produce, metadata, commit, create)
-	hb           *connection // dedicated connection for long-poll Heartbeat calls
-	codec        proto.Codec
-	codecLevel   uint8 // LZ4 level: 0 = fast, 1..9 = HC at that level
-	closed       bool
+	mu         sync.Mutex
+	rpc        *connection // shared connection for unary RPCs (produce, metadata, commit, create)
+	hb         *connection // dedicated connection for long-poll Heartbeat calls
+	codec      proto.Codec
+	codecLevel uint8 // LZ4 level: 0 = fast, 1..9 = HC at that level
+	closed     bool
 
 	subWG     sync.WaitGroup
 	subCancel []context.CancelFunc
@@ -876,4 +876,3 @@ func (c *connection) close() error {
 	}
 	return c.conn.Close()
 }
-

@@ -4,9 +4,10 @@ BIN_DIR := bin
 GO := go
 
 # Module-aware operations across the workspace. The workspace root is not
-# itself a module, so plain `./...` won't expand — we list each module path.
-MODULES := proto broker sdk cli examples
-PKGS := ./broker/... ./cli/... ./examples/... ./proto/... ./sdk/...
+# itself a module, so plain `./...` won't expand from the root — every
+# fmt/vet/test/lint/tidy target iterates per-module. Keep this list in
+# sync with go.work.
+MODULES := proto sdk broker cli connect registry streams examples
 
 build: broker cli
 
@@ -17,21 +18,32 @@ cli:
 	$(GO) build -o $(BIN_DIR)/holocronctl ./cli/cmd/holocronctl
 
 test:
-	$(GO) test $(PKGS)
+	@for m in $(MODULES); do \
+		echo "==> test $$m"; \
+		(cd $$m && $(GO) test ./...) || exit 1; \
+	done
 
 fmt:
-	$(GO) fmt $(PKGS)
+	@for m in $(MODULES); do \
+		(cd $$m && $(GO) fmt ./...) || exit 1; \
+	done
 
 vet:
-	$(GO) vet $(PKGS)
+	@for m in $(MODULES); do \
+		echo "==> vet $$m"; \
+		(cd $$m && $(GO) vet ./...) || exit 1; \
+	done
 
 lint: fmt vet
 	@command -v staticcheck >/dev/null || { echo "staticcheck not installed: go install honnef.co/go/tools/cmd/staticcheck@latest"; exit 1; }
-	staticcheck $(PKGS)
+	@for m in $(MODULES); do \
+		echo "==> staticcheck $$m"; \
+		(cd $$m && staticcheck ./...) || exit 1; \
+	done
 
 tidy:
 	@for m in $(MODULES); do \
-		echo "==> $$m"; \
+		echo "==> tidy $$m"; \
 		(cd $$m && $(GO) mod tidy); \
 	done
 
