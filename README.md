@@ -150,12 +150,20 @@ func main() {
 
 ## Configuration
 
-Stage 1 has no runtime configuration to speak of — the in-memory broker accepts no flags or environment variables. The variables below are reserved for later stages so that environment-driven deployment patterns are stable from the start.
+The daemon reads each setting from a flag, falling back to a `HOLOCRON_*` environment variable, then to the default. See [`docs/tls.md`](docs/tls.md) for the full TLS guide.
 
-| Variable | Default | Stage | Purpose |
-|---|---|---|---|
-| `HOLOCRON_DATA_DIR` | `/var/lib/holocron` | 2+ | Directory the broker writes its segmented log into. |
-| `HOLOCRON_LISTEN` | `:9092` | 3+ | Address the broker's network listener binds to. |
+| Variable | Default | Purpose |
+|---|---|---|
+| `HOLOCRON_DATA_DIR` | `/var/lib/holocron` | Directory the broker writes its segmented log into. |
+| `HOLOCRON_LISTEN` | `:9092` | Address the broker's wire-protocol listener binds to. |
+| `HOLOCRON_TLS_CERT` | — | PEM cert chain. Presence enables TLS on the wire listener. |
+| `HOLOCRON_TLS_KEY` | — | PEM private key matching `HOLOCRON_TLS_CERT`. |
+| `HOLOCRON_TLS_CLIENT_CA` | — | PEM CA bundle for client-cert verification (optional mTLS). |
+| `HOLOCRON_TLS_REQUIRE_CLIENT_CERT` | `false` | Reject clients without a verified cert (requires `HOLOCRON_TLS_CLIENT_CA`). |
+| `HOLOCRON_TLS_MIN_VERSION` | `1.3` | Minimum TLS version: `1.2` or `1.3`. |
+| `HOLOCRON_NODE_ID` | — | Node identifier in cluster mode. |
+| `HOLOCRON_RAFT_LISTEN` | `:9192` | Raft RPC bind address in cluster mode. |
+| `HOLOCRON_PEERS` | — | Cluster membership: `id=raft-addr=wire-addr,...` |
 
 ## Development
 
