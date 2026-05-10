@@ -37,7 +37,7 @@ type Transport struct {
 	addr        string
 	dialTimeout time.Duration
 	tlsConfig   *tls.Config
-	apiKey      string
+	credential  sdk.Credential
 
 	mu         sync.Mutex
 	rpc        *connection // shared connection for unary RPCs (produce, metadata, commit, create)
@@ -86,11 +86,20 @@ func WithTLS(cfg *tls.Config) Option {
 	return func(t *Transport) { t.tlsConfig = cfg }
 }
 
-// WithAPIKey sends the given key in the handshake on every new
-// connection. Brokers configured with an allow-list of keys reject
-// connections that don't present a matching one.
-func WithAPIKey(key string) Option {
-	return func(t *Transport) { t.apiKey = key }
+// WithCredential sends cred in the handshake on every new
+// connection. The broker's configured TokenVerifier accepts or
+// rejects the credential before any other RPC runs; an unknown
+// credential yields StatusUnauthorized.
+//
+// Use sdk.JWTCredential / sdk.APIKeyCredential / sdk.LoadCredentialFile
+// to construct cred, or build one directly:
+//
+//	holocronnet.WithCredential(sdk.Credential{
+//	    Kind:  sdk.CredentialJWT,
+//	    Bytes: token,
+//	})
+func WithCredential(cred sdk.Credential) Option {
+	return func(t *Transport) { t.credential = cred }
 }
 
 // Dial opens a network Transport to addr. The returned Transport is ready
@@ -814,10 +823,10 @@ func (t *Transport) dialAndHandshake(ctx context.Context) (*connection, error) {
 		return nil, fmt.Errorf("net: dial %s: %w", t.addr, err)
 	}
 	c := &connection{
-		conn:   raw,
-		r:      bufio.NewReader(raw),
-		w:      bufio.NewWriter(raw),
-		apiKey: t.apiKey,
+		conn:       raw,
+		r:          bufio.NewReader(raw),
+		w:          bufio.NewWriter(raw),
+		credential: t.credential,
 	}
 	if err := c.handshake(); err != nil {
 		_ = c.close()
@@ -831,25 +840,20 @@ func (t *Transport) dialAndHandshake(ctx context.Context) (*connection, error) {
 // higher level (the Transport's mutex on the shared connection, or one
 // connection per subscription).
 type connection struct {
-	conn   stdnet.Conn
-	r      *bufio.Reader
-	w      *bufio.Writer
-	apiKey string
-	mu     sync.Mutex
+	conn       stdnet.Conn
+	r          *bufio.Reader
+	w          *bufio.Writer
+	credential sdk.Credential
+	mu         sync.Mutex
 }
 
 func (c *connection) handshake() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Wire v10 carries credentials as a kind-tagged byte slice. PR 2
-	// preserves the existing WithAPIKey behaviour by encoding the
-	// stored key as CredentialAPIKey; PR 5 replaces the SDK option
-	// with WithCredential(Credential) so callers can hand in a JWT
-	// directly.
-	hs := proto.HandshakeRequest{Version: proto.WireVersion}
-	if c.apiKey != "" {
-		hs.CredentialKind = proto.CredentialAPIKey
-		hs.Credential = []byte(c.apiKey)
+	hs := proto.HandshakeRequest{
+		Version:        proto.WireVersion,
+		CredentialKind: c.credential.Kind,
+		Credential:     c.credential.Bytes,
 	}
 	body := hs.Encode()
 	if err := proto.WriteFrame(c.w, proto.OpHandshake, body); err != nil {
