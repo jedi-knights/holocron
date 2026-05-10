@@ -91,7 +91,24 @@ tr, err := holocronnet.Dial("broker.example.com:9092", holocronnet.WithTLS(&tls.
 
 For production, omit `RootCAs` entirely so the system trust store is used (assuming the broker uses a publicly-trusted cert).
 
-The bundled `examples/producer` and `examples/consumer` will accept `--tls-ca` flags for the same purpose in PR 3.
+### Round-trip with the bundled examples
+
+`examples/producer` and `examples/consumer` accept `--tls-ca` (verify the broker's cert against a custom CA) and `--tls-skip-verify` (lab escape hatch). Three terminals reproduce the loop end to end:
+
+```bash
+# Terminal 1 — TLS broker
+holocrond \
+  --memory --listen 127.0.0.1:9092 \
+  --tls-cert cert.pem --tls-key key.pem
+
+# Terminal 2 — producer over TLS
+go run ./examples/producer --addr 127.0.0.1:9092 --tls-ca cert.pem --count 5
+
+# Terminal 3 — consumer over TLS
+go run ./examples/consumer --addr 127.0.0.1:9092 --tls-ca cert.pem
+```
+
+`HOLOCRON_TLS_CA` is honoured as the env-var fallback for `--tls-ca` so the same config can be set process-wide.
 
 ## Configuration reference
 
