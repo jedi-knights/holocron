@@ -164,6 +164,17 @@ func (b *Broker) Registry() *topic.Registry { return b.registry }
 // constructed without one.
 func (b *Broker) Groups() *groups.Manager { return b.groups }
 
+// Store exposes the broker's underlying storage.Store, primarily so
+// SyncFromLeader's external orchestrator can write records into
+// the local store directly via cluster.SyncPartitionFromPeer
+// without going through Publish (which would cycle through Raft on
+// a clustered broker).
+//
+// Callers that aren't part of the Stage 9 catch-up path should use
+// Publish/Read; this accessor is a deliberate seam, not the broker's
+// general-purpose storage interface.
+func (b *Broker) Store() storage.Store { return b.store }
+
 // Publish appends a record to the addressed partition and fans it out to
 // live subscribers. Both happen under the partition's lock so subscribers
 // observe records in append order with consistent offsets.

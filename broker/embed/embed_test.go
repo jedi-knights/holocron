@@ -1118,6 +1118,101 @@ func addrFromBroker(t *testing.T, b *embed.Broker) string {
 	return addr
 }
 
+// TestEmbed_SyncFromLeader_FillsEmptyBroker proves the Stage 9
+// milestone-4 orchestrator: a fresh broker with the same topic
+// registry as a donor catches up on records by calling
+// SyncFromLeader against the donor's wire transport. Closes the
+// gap that exists when a fresh follower joins a cluster after the
+// Raft log has been truncated past the FSM snapshot — the
+// snapshot carries metadata only, so records have to come from a
+// peer's segment-streaming path.
+//
+// This test exercises the orchestration without going through
+// Raft AddVoter; M5/M6 add the cluster-integration scenarios with
+// forced log truncation.
+func TestEmbed_SyncFromLeader_FillsEmptyBroker(t *testing.T) {
+	// Arrange — donor broker with 5 records on each of 2 partitions.
+	donor := embed.NewMemory()
+	defer donor.Close()
+	if err := donor.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	donorAddr, err := donor.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for p := int32(0); p < 2; p++ {
+		for i := 0; i < 5; i++ {
+			if _, err := donor.Transport().Publish(ctx, proto.PartitionRef{Topic: "events", Index: p}, proto.Record{Value: []byte{byte(i)}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// A fresh recipient broker — same registry shape (topic with 2
+	// partitions) so SyncFromLeader has something to enumerate; an
+	// empty store so there's an actual gap to fill.
+	recipient := embed.NewMemory()
+	defer recipient.Close()
+	if err := recipient.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act — sync from the donor's wire transport.
+	tr, err := holocronnet.Dial(donorAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	total, err := recipient.SyncFromLeader(ctx, tr)
+	if err != nil {
+		t.Fatalf("SyncFromLeader: %v", err)
+	}
+
+	// Assert — 10 records appended (5 per partition × 2).
+	if total != 10 {
+		t.Errorf("total appended: got %d, want 10", total)
+	}
+	for p := int32(0); p < 2; p++ {
+		c, err := sdk.NewConsumer(recipient.Transport())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Assign(ctx, proto.PartitionRef{Topic: "events", Index: p}, 0); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]proto.Record, 0, 5)
+		for len(got) < 5 {
+			recs, err := c.Poll(ctx, 5-len(got))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, recs...)
+		}
+		_ = c.Close()
+		if len(got) != 5 {
+			t.Errorf("partition %d: got %d records, want 5", p, len(got))
+		}
+		for i, r := range got {
+			if r.Offset != int64(i) {
+				t.Errorf("partition %d record %d: offset %d, want %d", p, i, r.Offset, i)
+			}
+		}
+	}
+
+	// Idempotency — second call is a no-op (already caught up).
+	again, err := recipient.SyncFromLeader(ctx, tr)
+	if err != nil {
+		t.Fatalf("second SyncFromLeader: %v", err)
+	}
+	if again != 0 {
+		t.Errorf("second sync appended %d, want 0 (already caught up)", again)
+	}
+}
+
 // TestEmbed_BrokerStats proves Broker.Stats() reports a one-call
 // observability snapshot of the broker — topic count, partition
 // count totaled across topics, and clustering info. Useful for

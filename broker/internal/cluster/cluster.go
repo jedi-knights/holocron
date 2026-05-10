@@ -292,6 +292,18 @@ func (c *Cluster) Members() []Peer {
 	return out
 }
 
+// Snapshot triggers a Raft snapshot now, regardless of the
+// configured SnapshotThreshold. After the snapshot completes, log
+// entries up to the snapshot index become eligible for truncation
+// — useful in tests that need to force-create the "gap" Stage 9's
+// catch-up path fills.
+//
+// In production this is rarely called directly; Raft's automatic
+// snapshot scheduling handles it based on log size.
+func (c *Cluster) Snapshot() error {
+	return c.raft.Snapshot().Error()
+}
+
 // Close shuts down Raft, the transport, and the bolt stores. After Close
 // the Cluster cannot be reused.
 func (c *Cluster) Close() error {

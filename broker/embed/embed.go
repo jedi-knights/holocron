@@ -281,6 +281,51 @@ func (b *Broker) CreateTopic(spec TopicSpec) error {
 // Topics returns a snapshot of registered topics.
 func (b *Broker) Topics() []proto.TopicConfig { return b.registry.List() }
 
+// SyncFromLeader runs the Stage 9 catch-up path: for every (topic,
+// partition) the local registry knows about, stream records from
+// peer into the local store until the local high-water reaches the
+// peer's at call time. Returns the total records appended.
+//
+// The peer is supplied externally — typically the cluster leader's
+// wire transport, but any cluster.SyncPeer will do. The
+// orchestrator doesn't auto-discover the leader because the embed
+// surface shouldn't dial wire addresses on the caller's behalf;
+// the caller (which already knows how to reach peers) passes one
+// in.
+//
+// Skips partitions whose local high-water already meets the
+// peer's. Goes directly through the broker's storage.Store,
+// bypassing the FSM dedup guard (which is for the inverse case:
+// Raft Apply entries that arrive after sync).
+//
+// Designed for the Stage 9 cluster join flow — a fresh follower
+// runs this after Raft snapshot install and before serving reads,
+// so its local store catches up on records the FSM snapshot
+// didn't carry. The local broker doesn't have to be clustered:
+// the operation is a generic "sync this broker's records from a
+// peer," useful for migration and manual recovery as well.
+func (b *Broker) SyncFromLeader(ctx context.Context, peer cluster.SyncPeer) (int, error) {
+	if peer == nil {
+		return 0, errors.New("embed: SyncFromLeader requires a non-nil peer")
+	}
+	store := b.core.Store()
+	if store == nil {
+		return 0, errors.New("embed: broker has no store")
+	}
+	total := 0
+	for _, t := range b.registry.List() {
+		for i := int32(0); i < t.PartitionCount; i++ {
+			pref := proto.PartitionRef{Topic: t.Name, Index: i}
+			n, err := cluster.SyncPartitionFromPeer(ctx, peer, store, pref)
+			if err != nil {
+				return total, fmt.Errorf("embed: sync %v: %w", pref, err)
+			}
+			total += n
+		}
+	}
+	return total, nil
+}
+
 // BrokerStats is a one-call observability snapshot of the broker.
 // Captured by walking the registry once so topic/partition counts
 // are consistent at a single moment. Clustering fields are
