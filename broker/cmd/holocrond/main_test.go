@@ -1,6 +1,11 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -153,4 +158,106 @@ func TestRun_ClusterTLSWithoutClusterMode(t *testing.T) {
 	if !strings.Contains(err.Error(), "--cluster") {
 		t.Errorf("expected error to mention --cluster, got %q", err)
 	}
+}
+
+// Auth flag validation must fail fast — before the broker is opened
+// or the signal-handling loop begins — so bad config surfaces as an
+// immediate error from run() rather than a hung process.
+
+func TestRun_AuthIssuerKeyBadPath(t *testing.T) {
+	bogus := filepath.Join(t.TempDir(), "missing.pem")
+	err := run([]string{
+		"--memory", "--listen=",
+		"--auth-issuer-key", bogus,
+	})
+	if err == nil {
+		t.Fatal("expected error for nonexistent --auth-issuer-key path, got nil")
+	}
+}
+
+func TestRun_AuthIssuerKeyBadPEM(t *testing.T) {
+	junk := filepath.Join(t.TempDir(), "junk.pem")
+	if err := os.WriteFile(junk, []byte("not pem material\n"), 0o600); err != nil {
+		t.Fatalf("write junk: %v", err)
+	}
+	err := run([]string{
+		"--memory", "--listen=",
+		"--auth-issuer-key", junk,
+	})
+	if err == nil {
+		t.Fatal("expected error for non-PEM --auth-issuer-key file, got nil")
+	}
+}
+
+func TestRun_AuthIssuerKeyRequiresListener(t *testing.T) {
+	keyPath := writeEd25519PublicKeyPEM(t)
+	err := run([]string{
+		"--memory", "--listen=",
+		"--auth-issuer-key", keyPath,
+	})
+	if err == nil {
+		t.Fatal("expected error when --auth-issuer-key supplied without --listen, got nil")
+	}
+	if !strings.Contains(err.Error(), "listen") {
+		t.Errorf("expected error to mention --listen, got %q", err)
+	}
+}
+
+func TestRun_AuthDenylistWithoutIssuer(t *testing.T) {
+	denylistPath := filepath.Join(t.TempDir(), "deny.txt")
+	if err := os.WriteFile(denylistPath, []byte("alice\n"), 0o600); err != nil {
+		t.Fatalf("write denylist: %v", err)
+	}
+	err := run([]string{
+		"--memory", "--listen=",
+		"--auth-denylist", denylistPath,
+	})
+	if err == nil {
+		t.Fatal("expected error when --auth-denylist supplied without --auth-issuer-key, got nil")
+	}
+	if !strings.Contains(err.Error(), "issuer") {
+		t.Errorf("expected error to mention --auth-issuer-key, got %q", err)
+	}
+}
+
+func TestRun_AuthDenylistBadPath(t *testing.T) {
+	keyPath := writeEd25519PublicKeyPEM(t)
+	bogus := filepath.Join(t.TempDir(), "missing-deny.txt")
+	err := run([]string{
+		"--memory", "--listen=:0",
+		"--auth-issuer-key", keyPath,
+		"--auth-denylist", bogus,
+	})
+	if err == nil {
+		t.Fatal("expected error for nonexistent --auth-denylist file, got nil")
+	}
+}
+
+// writeEd25519PublicKeyPEM generates an Ed25519 keypair, encodes the
+// public key as a PKIX PEM block, writes it to t.TempDir(), and
+// returns the path. Used to validate --auth-issuer-key flag parsing
+// without requiring openssl on the test runner.
+func writeEd25519PublicKeyPEM(t *testing.T) string {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey: %v", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatalf("MarshalPKIXPublicKey: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "issuer.pub.pem")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create %s: %v", path, err)
+	}
+	if err := pem.Encode(f, &pem.Block{Type: "PUBLIC KEY", Bytes: der}); err != nil {
+		_ = f.Close()
+		t.Fatalf("encode pem: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", path, err)
+	}
+	return path
 }
