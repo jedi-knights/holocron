@@ -19,6 +19,17 @@ import (
 	"github.com/jedi-knights/holocron/proto"
 )
 
+// OffsetUnstamped is the sentinel for a CmdAppend whose Offset
+// hasn't been assigned by the leader. The FSM skips dedup for
+// unstamped commands and lets store.Append assign the offset
+// locally — the pre-Stage-9 behavior.
+//
+// Stage 9 milestone 2 introduces this sentinel; milestone 3 will
+// teach the leader to stamp the real offset. Until then every
+// command from publishClustered carries OffsetUnstamped and the
+// FSM's dedup guard is inert.
+const OffsetUnstamped int64 = -1
+
 // CommandKind tags each Raft log entry's payload type.
 type CommandKind uint8
 

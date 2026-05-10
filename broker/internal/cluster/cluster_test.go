@@ -134,9 +134,14 @@ func TestCluster_ThreeNodeReplicatesAppends(t *testing.T) {
 
 	const records = 5
 	for i := range records {
+		// OffsetUnstamped: this test bypasses publishClustered (which
+		// stamps the sentinel itself); without it the FSM's dedup
+		// guard would treat the zero value as a real offset and skip
+		// every record after the first.
 		_, err := ldr.cluster.Apply(EncodeAppend(AppendCommand{
 			Topic:     "events",
 			Partition: 0,
+			Offset:    OffsetUnstamped,
 			Record: proto.Record{
 				Key:   []byte{byte(i)},
 				Value: []byte("payload"),
@@ -251,6 +256,86 @@ func containsID(peers []Peer, id string) bool {
 		}
 	}
 	return false
+}
+
+// TestFSM_DedupGuardSkipsAlreadyAppliedOffsets proves the Stage 9
+// milestone-2 dedup guard: when a CmdAppend carries an Offset at or
+// below the local store's high-water, FSM.applyAppend skips the
+// store.Append (the record is already present from a prior segment
+// sync) but reports success so the Raft log advances. Without the
+// guard, a fresh follower whose local store was bootstrapped via
+// segment sync would double-apply records as Raft replays history.
+//
+// Three commands cover the regimes:
+//
+//	cmd.Offset < hw    → skip (already applied)
+//	cmd.Offset == hw   → append (next expected)
+//	cmd.Offset == OffsetUnstamped → append (milestone-1 path; leader
+//	                     hasn't stamped, store assigns the offset)
+func TestFSM_DedupGuardSkipsAlreadyAppliedOffsets(t *testing.T) {
+	// Arrange — pre-populate the store with offsets 0..2 so high-water = 3.
+	store := storage.NewMemoryStore()
+	reg := topic.NewRegistry()
+	fsm := NewFSM(store, reg)
+	if r := fsm.Apply(&raft.Log{
+		Data: EncodeCreateTopic(CreateTopicCommand{Name: "events", PartitionCount: 1}),
+	}); r != nil {
+		if err, ok := r.(error); ok {
+			t.Fatal(err)
+		}
+	}
+	pref := proto.PartitionRef{Topic: "events", Index: 0}
+	for i := 0; i < 3; i++ {
+		if _, err := store.Append(context.Background(), pref, proto.Record{Value: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hw, _ := store.HighWater(context.Background(), pref)
+	if hw != 3 {
+		t.Fatalf("setup high-water: got %d, want 3", hw)
+	}
+
+	// Act 1 — Offset=1 is below high-water; skip the append.
+	dup := fsm.Apply(&raft.Log{
+		Data: EncodeAppend(AppendCommand{
+			Topic: "events", Partition: 0, Offset: 1,
+			Record: proto.Record{Value: []byte("dup")},
+		}),
+	})
+	if err, ok := dup.(error); ok {
+		t.Fatalf("dup apply errored: %v", err)
+	}
+	if hw, _ := store.HighWater(context.Background(), pref); hw != 3 {
+		t.Errorf("after dup apply: got hw %d, want 3 (skip didn't fire)", hw)
+	}
+
+	// Act 2 — Offset=3 matches high-water (next expected); append.
+	next := fsm.Apply(&raft.Log{
+		Data: EncodeAppend(AppendCommand{
+			Topic: "events", Partition: 0, Offset: 3,
+			Record: proto.Record{Value: []byte("real")},
+		}),
+	})
+	if err, ok := next.(error); ok {
+		t.Fatalf("next apply errored: %v", err)
+	}
+	if hw, _ := store.HighWater(context.Background(), pref); hw != 4 {
+		t.Errorf("after next apply: got hw %d, want 4", hw)
+	}
+
+	// Act 3 — OffsetUnstamped (milestone-1 path); append regardless of hw.
+	legacy := fsm.Apply(&raft.Log{
+		Data: EncodeAppend(AppendCommand{
+			Topic: "events", Partition: 0, Offset: OffsetUnstamped,
+			Record: proto.Record{Value: []byte("legacy")},
+		}),
+	})
+	if err, ok := legacy.(error); ok {
+		t.Fatalf("legacy apply errored: %v", err)
+	}
+	if hw, _ := store.HighWater(context.Background(), pref); hw != 5 {
+		t.Errorf("after legacy apply: got hw %d, want 5", hw)
+	}
 }
 
 // TestFSM_SnapshotRestoreRebuildsRegistry proves the FSM's snapshot

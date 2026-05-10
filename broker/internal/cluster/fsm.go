@@ -83,6 +83,18 @@ func (f *FSM) applyAppend(body []byte) any {
 		return err
 	}
 	pref := proto.PartitionRef{Topic: cmd.Topic, Index: cmd.Partition}
+	// Stage 9 dedup guard: a stamped Offset at or below the local
+	// store's high-water means this record is already on disk —
+	// either from a prior segment-sync or from a Raft replay
+	// after restart. Skip the append but report success so the
+	// Raft log advances. OffsetUnstamped (the milestone-1 default)
+	// disables the guard so legacy commands behave as before.
+	if cmd.Offset != OffsetUnstamped {
+		hw, hwErr := f.store.HighWater(context.Background(), pref)
+		if hwErr == nil && cmd.Offset < hw {
+			return cmd.Offset
+		}
+	}
 	off, err := f.store.Append(context.Background(), pref, cmd.Record)
 	if err != nil {
 		return err

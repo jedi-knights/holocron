@@ -255,7 +255,12 @@ func (b *Broker) publishClustered(ctx context.Context, p proto.PartitionRef, r p
 	resp, err := b.cluster.Apply(cluster.EncodeAppend(cluster.AppendCommand{
 		Topic:     p.Topic,
 		Partition: p.Index,
-		Record:    r,
+		// Offset stays unstamped until Stage 9 milestone 3 teaches
+		// the leader to predict the next-offset under partition lock.
+		// Followers' FSM treats OffsetUnstamped as "let store.Append
+		// assign the offset" — pre-Stage-9 behavior.
+		Offset: cluster.OffsetUnstamped,
+		Record: r,
 	}))
 	if err != nil {
 		return 0, fmt.Errorf("broker: cluster apply: %w", err)
