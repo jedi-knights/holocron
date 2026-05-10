@@ -1,8 +1,8 @@
 # Authentication
 
-This document covers Holocron's authentication surface — how the broker decides *who* an inbound RPC came from. Authorization (what that identity may do) is a separate Wave-1 follow-on; today every authenticated principal can do everything.
+This document covers Holocron's authentication surface — how the broker decides *who* an inbound RPC came from. For **what** that identity may do (per-topic ACLs based on JWT scopes), see [`authorization.md`](authorization.md). For TLS (encryption + cert verification), see [`tls.md`](tls.md).
 
-For TLS (encryption + cert verification), see [`tls.md`](tls.md). Auth and TLS compose: TLS protects the wire, auth identifies the caller. Most production deployments want both.
+The three layers compose: TLS protects the wire, auth identifies the caller, authorization gates the action. Most production deployments want all three.
 
 ## Trust model
 
@@ -76,7 +76,7 @@ A JWT is a base64url-encoded `header.payload.signature` triple. The header decla
 | `nbf` | optional | Not-before — Unix seconds. Useful for staged rollouts. |
 | `iss` | optional | Issuer name — operator identifier; audit-logged. |
 | `holocron.account` | optional | Tenant the subject belongs to. Inert in v1; carried for forward compatibility with multi-tenancy. |
-| `holocron.scopes` | optional | List of `verb:resource` permissions (e.g. `produce:events`). Inert in v1 (no authorization yet); carried for forward compatibility. |
+| `holocron.scopes` | optional | List of `verb:resource` permissions (e.g. `produce:events`). **Enforced** by the broker's authorizer — see [`authorization.md`](authorization.md) for the grammar and worked examples. |
 
 ### Issuing with `holocronctl auth issue`
 
@@ -168,6 +168,6 @@ The reload is atomic — no in-flight handshake observes a half-loaded set. A re
 ## Limitations and roadmap
 
 - **No mTLS-CN-as-Principal mapping** — the design includes `--auth-mtls-cn-mapping` so a verified client cert's CN can serve as the Principal without a separate JWT. Carved out to a smaller follow-on PR.
-- **No authorization yet.** Every authenticated Principal has full access. Per-topic ACLs and per-account quotas already exist for the legacy API-key path; threading the `Principal.Scopes` field through them is on the Wave-1 list.
+- **Per-account quotas not enforced yet.** The `holocron.account` claim is parsed and threaded through the audit log but does not gate any operation in v1. Multi-tenancy (per-account quotas + topic visibility) is the next Wave-1 item after this one.
 - **Single signing key.** Multi-key trust ("accept tokens signed by either the old or new key during rollover") is a planned follow-on. Today, rotating the operator key is a planned restart.
 - **Operator key sits on disk.** A KMS adapter (AWS KMS / Vault Transit) is on the radar — the `Signer` interface is shaped for it — but file-on-disk is the v1 default.

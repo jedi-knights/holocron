@@ -35,7 +35,8 @@ NATS JetStream is the alternative Holocron is positioned against most directly. 
 | Schema registry | None native | Yes (Confluent-shape HTTP API, broker-backed) | **Holocron win** |
 | KV store layered on the log | Yes | No | **Gap** |
 | Object store layered on the log | Yes | No | **Gap** |
-| Authentication (JWT / NKey / accounts) | Yes | No | **Gap** |
+| Authentication (JWT / NKey / accounts) | Yes | Yes (Ed25519-signed JWT) | Parity |
+| Per-topic authorization (ACLs) | Yes (claims + accounts) | Yes (JWT scope claims) | Parity |
 | Multi-tenancy / account isolation | Yes | No | **Gap** |
 | Mirror / source streams (cross-stream replication) | Yes | No | **Gap** |
 | Leaf nodes (edge / IoT connectivity) | Yes | No | **Gap** |
