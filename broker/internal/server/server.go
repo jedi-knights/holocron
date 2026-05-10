@@ -537,7 +537,12 @@ func (s *Server) handleProduce(apiKey string, body []byte, w io.Writer) error {
 		}
 	}
 	pref := proto.PartitionRef{Topic: req.Topic, Index: req.Partition}
-	offset, err := s.core.Publish(context.Background(), pref, req.Record)
+	// Attach the Principal so cluster.Apply's audit log names the
+	// originating subject. Account / Scopes ride along once the
+	// connection stores the full Principal — for now Subject (== the
+	// pre-threading apiKey value) is the load-bearing field.
+	ctx := auth.WithPrincipal(context.Background(), auth.Principal{Subject: apiKey})
+	offset, err := s.core.Publish(ctx, pref, req.Record)
 	if err != nil {
 		return s.respondError(w, proto.OpProduce, err)
 	}
@@ -1015,12 +1020,13 @@ func (s *Server) handleProduceBatch(apiKey string, body []byte, w io.Writer) err
 		}
 	}
 	pref := proto.PartitionRef{Topic: req.Topic, Index: req.Partition}
-	baseOffset, err := s.core.Publish(context.Background(), pref, req.Records[0])
+	ctx := auth.WithPrincipal(context.Background(), auth.Principal{Subject: apiKey})
+	baseOffset, err := s.core.Publish(ctx, pref, req.Records[0])
 	if err != nil {
 		return s.respondError(w, proto.OpProduceBatch, err)
 	}
 	for i := 1; i < len(req.Records); i++ {
-		if _, err := s.core.Publish(context.Background(), pref, req.Records[i]); err != nil {
+		if _, err := s.core.Publish(ctx, pref, req.Records[i]); err != nil {
 			return s.respondError(w, proto.OpProduceBatch, err)
 		}
 	}

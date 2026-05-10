@@ -1,9 +1,11 @@
 package cluster
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,6 +13,8 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+
+	"github.com/jedi-knights/holocron/broker/internal/auth"
 )
 
 // Defaults tuned for educational visibility.
@@ -41,6 +45,12 @@ type Config struct {
 	// cert chain plus a RootCAs / GetCertificate setup that satisfies
 	// both directions. Nil keeps the wire-compatible plaintext path.
 	TLSConfig *tls.Config
+	// Logger receives the audit-log line emitted at each Apply, naming
+	// the requesting Principal (subject + account + source) and the
+	// command size. Nil falls back to slog.Default(). Tests inject a
+	// captured logger to assert audit content; production passes the
+	// daemon's structured logger.
+	Logger *slog.Logger
 }
 
 // Cluster is a Raft-replicated wrapper around an FSM. It exposes Apply
@@ -53,6 +63,7 @@ type Cluster struct {
 	stable    *raftboltdb.BoltStore
 	snaps     *raft.FileSnapshotStore
 	raft      *raft.Raft
+	logger    *slog.Logger
 }
 
 // New brings up a Raft cluster with the given configuration and FSM.
@@ -143,6 +154,10 @@ func New(cfg Config, fsm *FSM) (*Cluster, error) {
 		return nil, fmt.Errorf("cluster: raft: %w", err)
 	}
 
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	c := &Cluster{
 		cfg:       cfg,
 		fsm:       fsm,
@@ -151,6 +166,7 @@ func New(cfg Config, fsm *FSM) (*Cluster, error) {
 		stable:    stable,
 		snaps:     snaps,
 		raft:      r,
+		logger:    logger,
 	}
 
 	if cfg.Bootstrap {
@@ -243,7 +259,22 @@ func (c *Cluster) WaitForLeader(timeout time.Duration) error {
 // Apply submits a command for replication and waits for it to be
 // committed across the cluster (Raft majority). Only valid on the leader
 // — followers return raft.ErrNotLeader.
-func (c *Cluster) Apply(cmd []byte) (any, error) {
+//
+// ctx carries the requesting Principal (via auth.WithPrincipal) for
+// audit-logging. The Principal does not flow into the Raft log itself
+// — the audit fires on the leader where the request originates and is
+// captured by the per-Cluster slog Logger; followers replay the command
+// without re-emitting the audit line. Multi-tenancy and per-account
+// quotas attach here in later wave-1 work.
+func (c *Cluster) Apply(ctx context.Context, cmd []byte) (any, error) {
+	p := auth.PrincipalFromContext(ctx)
+	c.logger.Info("cluster apply",
+		"node", c.cfg.NodeID,
+		"subject", p.Subject,
+		"account", p.Account,
+		"source", p.Source,
+		"bytes", len(cmd),
+	)
 	future := c.raft.Apply(cmd, c.cfg.ApplyTimeout)
 	if err := future.Error(); err != nil {
 		return nil, err

@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"path/filepath"
@@ -46,6 +47,13 @@ type node struct {
 }
 
 func startCluster(t *testing.T, n int) []*node {
+	return startClusterWithLogger(t, n, nil)
+}
+
+// startClusterWithLogger is the same as startCluster but injects a
+// shared *slog.Logger on every node's cluster.Config so audit-log
+// tests can capture Apply lines into a buffer.
+func startClusterWithLogger(t *testing.T, n int, logger *slog.Logger) []*node {
 	t.Helper()
 	addrs := make([]string, n)
 	for i := range n {
@@ -68,6 +76,7 @@ func startCluster(t *testing.T, n int) []*node {
 			DataDir:   dir,
 			Peers:     peers,
 			Bootstrap: i == 0,
+			Logger:    logger,
 		}, fsm)
 		if err != nil {
 			t.Fatal(err)
@@ -125,7 +134,7 @@ func TestCluster_ThreeNodeReplicatesAppends(t *testing.T) {
 	ldr := leader(t, nodes, 5*time.Second)
 
 	// Create a topic via the FSM so partitions exist on every node.
-	if _, err := ldr.cluster.Apply(EncodeCreateTopic(CreateTopicCommand{
+	if _, err := ldr.cluster.Apply(context.Background(), EncodeCreateTopic(CreateTopicCommand{
 		Name:           "events",
 		PartitionCount: 1,
 	})); err != nil {
@@ -138,7 +147,7 @@ func TestCluster_ThreeNodeReplicatesAppends(t *testing.T) {
 		// stamps the sentinel itself); without it the FSM's dedup
 		// guard would treat the zero value as a real offset and skip
 		// every record after the first.
-		_, err := ldr.cluster.Apply(EncodeAppend(AppendCommand{
+		_, err := ldr.cluster.Apply(context.Background(), EncodeAppend(AppendCommand{
 			Topic:     "events",
 			Partition: 0,
 			Offset:    OffsetUnstamped,
@@ -186,7 +195,7 @@ func TestCluster_FollowerRejectsApply(t *testing.T) {
 	if follower == nil {
 		t.Fatal("no follower found")
 	}
-	_, err := follower.cluster.Apply(EncodeCreateTopic(CreateTopicCommand{Name: "x", PartitionCount: 1}))
+	_, err := follower.cluster.Apply(context.Background(), EncodeCreateTopic(CreateTopicCommand{Name: "x", PartitionCount: 1}))
 	if err == nil {
 		t.Fatal("follower accepted Apply; expected error")
 	}
@@ -241,7 +250,7 @@ func TestCluster_RemoveVoterShrinksMembership(t *testing.T) {
 	if len(members) != 2 {
 		t.Errorf("expected 2 voters after removal, got %d", len(members))
 	}
-	if _, err := ldr.cluster.Apply(EncodeCreateTopic(CreateTopicCommand{
+	if _, err := ldr.cluster.Apply(context.Background(), EncodeCreateTopic(CreateTopicCommand{
 		Name:           "post-evict",
 		PartitionCount: 1,
 	})); err != nil {
@@ -476,7 +485,7 @@ func TestCluster_TLSTransport_BootstrapsWithTLS(t *testing.T) {
 	}
 
 	// And exercise the FSM through the TLS transport.
-	if _, err := cl.Apply(EncodeCreateTopic(CreateTopicCommand{
+	if _, err := cl.Apply(context.Background(), EncodeCreateTopic(CreateTopicCommand{
 		Name:           "events",
 		PartitionCount: 1,
 	})); err != nil {
