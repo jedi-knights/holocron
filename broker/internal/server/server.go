@@ -69,9 +69,10 @@ type Server struct {
 	closing       bool
 	wg            sync.WaitGroup
 	verifier      auth.TokenVerifier      // produces a Principal at handshake; defaults to AnonymousVerifier
+	authorizer    auth.Authorizer         // gates per-op actions; defaults to AllowAllAuthorizer
 	produceQuotas map[string]*tokenBucket // per-Principal-Subject produce limiter
 	fetchQuotas   map[string]*tokenBucket // per-Principal-Subject fetch limiter
-	acls          map[string]aclEntry     // per-Principal-Subject authorization
+	acls          map[string]aclEntry     // per-Principal-Subject authorization (legacy WithACL path; PR 4 retires)
 }
 
 // ACL is the public-facing per-key authorization table. Produce and
@@ -253,10 +254,9 @@ func (s *Server) SetAPIKeys(keys []string) {
 }
 
 // SetVerifier installs an auth.TokenVerifier. The verifier is called
-// once per connection at handshake; the resulting Principal's Subject
-// becomes the apiKey string flowing through the rest of the request
-// path (preserved unchanged in PR 3 to keep ACL/quota lookups working;
-// PR 7 threads the full Principal).
+// once per connection at handshake; the resulting Principal flows
+// through dispatch into per-op handlers, which consult the configured
+// Authorizer for produce / consume / admin enforcement.
 func (s *Server) SetVerifier(v auth.TokenVerifier) {
 	if v == nil {
 		v = auth.AnonymousVerifier{}
@@ -266,18 +266,50 @@ func (s *Server) SetVerifier(v auth.TokenVerifier) {
 	s.mu.Unlock()
 }
 
+// SetAuthorizer installs an auth.Authorizer. The authorizer is called
+// at every per-op boundary that gates produce / consume / admin (PR 2
+// covers produce + consume; PR 3 adds admin). Defaults to
+// AllowAllAuthorizer — every action admitted regardless of scopes —
+// which is the right shape when no verifier is configured. When
+// callers install a real verifier, they should also install
+// ScopeAuthorizer (or another deny-by-default authorizer); the
+// embed.WithAuthVerifier option does this automatically.
+func (s *Server) SetAuthorizer(a auth.Authorizer) {
+	if a == nil {
+		a = auth.AllowAllAuthorizer{}
+	}
+	s.mu.Lock()
+	s.authorizer = a
+	s.mu.Unlock()
+}
+
+// authorize is the per-handler boundary that consults the configured
+// Authorizer. Returns nil when the action is permitted; returns an
+// auth.ErrUnauthorized-wrapped error otherwise. Handlers translate
+// that error into proto.StatusForbidden on the wire.
+func (s *Server) authorize(p auth.Principal, action auth.Action, resource string) error {
+	s.mu.Lock()
+	az := s.authorizer
+	s.mu.Unlock()
+	return az.Authorize(p, action, resource)
+}
+
 // New returns a Server bound to the given Broker. The default
-// verifier is AnonymousVerifier — every handshake admits, no
-// credential is required. Callers wire a real verifier via
-// SetVerifier (or SetAPIKeys for the legacy bearer flow).
+// verifier is AnonymousVerifier and the default authorizer is
+// AllowAllAuthorizer — every handshake admits, every action passes,
+// and the broker behaves as if no auth were configured. Callers wire
+// a real verifier via SetVerifier (or SetAPIKeys for the legacy
+// bearer flow); SetAuthorizer (typically auto-installed by
+// embed.WithAuthVerifier) flips into deny-by-default mode.
 func New(b *broker.Broker) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		core:      b,
-		ctx:       ctx,
-		cancelCtx: cancel,
-		conns:     make(map[net.Conn]struct{}),
-		verifier:  auth.AnonymousVerifier{},
+		core:       b,
+		ctx:        ctx,
+		cancelCtx:  cancel,
+		conns:      make(map[net.Conn]struct{}),
+		verifier:   auth.AnonymousVerifier{},
+		authorizer: auth.AllowAllAuthorizer{},
 	}
 }
 
@@ -393,7 +425,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
 
-	apiKey, err := s.handshake(r, w)
+	principal, err := s.handshake(r, w)
 	if err != nil {
 		return
 	}
@@ -410,7 +442,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			}
 			return
 		}
-		if err := s.dispatch(op, apiKey, body, w); err != nil {
+		if err := s.dispatch(op, principal, body, w); err != nil {
 			return
 		}
 		if err := w.Flush(); err != nil {
@@ -419,33 +451,31 @@ func (s *Server) serveConn(conn net.Conn) {
 	}
 }
 
-// handshake validates the wire version + API key. Returns the
-// authenticated API key (or "" if no auth is configured) so the per-
-// connection serve loop can apply per-key quotas to subsequent
-// requests.
-func (s *Server) handshake(r io.Reader, w io.Writer) (string, error) {
+// handshake validates the wire version and runs the configured
+// verifier against the credential the client presented. Returns the
+// resulting auth.Principal, which flows through dispatch into every
+// per-op handler so the authorizer can gate by Subject, Account, and
+// Scopes. Anonymous deployments (default AnonymousVerifier) yield the
+// Anonymous principal; the AllowAllAuthorizer admits it everywhere.
+func (s *Server) handshake(r io.Reader, w io.Writer) (auth.Principal, error) {
 	op, body, err := proto.ReadFrame(r)
 	if err != nil {
-		return "", err
+		return auth.Principal{}, err
 	}
 	if op != proto.OpHandshake {
 		_ = proto.WriteErrorResponse(w, op, proto.StatusInvalidRequest, "expected handshake")
-		return "", errors.New("handshake: wrong opcode")
+		return auth.Principal{}, errors.New("handshake: wrong opcode")
 	}
 	hs, err := proto.DecodeHandshakeRequest(body)
 	if err != nil {
 		_ = proto.WriteErrorResponse(w, op, proto.StatusInvalidRequest, err.Error())
-		return "", err
+		return auth.Principal{}, err
 	}
 	if hs.Version != proto.WireVersion {
 		_ = proto.WriteErrorResponse(w, op, proto.StatusVersionMismatch,
 			fmt.Sprintf("server speaks v%d, client v%d", proto.WireVersion, hs.Version))
-		return "", errors.New("handshake: version mismatch")
+		return auth.Principal{}, errors.New("handshake: version mismatch")
 	}
-	// Hand the wire credential to the configured verifier. Default
-	// (AnonymousVerifier) admits every handshake and returns the
-	// Anonymous principal; APIKeyVerifier and Ed25519Verifier reject
-	// invalid credentials before any other RPC runs.
 	s.mu.Lock()
 	verifier := s.verifier
 	s.mu.Unlock()
@@ -456,21 +486,17 @@ func (s *Server) handshake(r io.Reader, w io.Writer) (string, error) {
 	principal, err := verifier.Verify(cred)
 	if err != nil {
 		_ = proto.WriteErrorResponse(w, op, proto.StatusUnauthorized, err.Error())
-		return "", fmt.Errorf("handshake: %w", err)
+		return auth.Principal{}, fmt.Errorf("handshake: %w", err)
 	}
-	// Principal.Subject becomes the apiKey string flowing through the
-	// rest of the request path. Anonymous → empty string, which
-	// matches the historical no-auth behaviour for ACL / quota
-	// lookups. PR 7 threads the full Principal through cluster.Apply.
-	return principal.Subject, proto.WriteResponse(w, op, proto.StatusOK, []byte{proto.WireVersion})
+	return principal, proto.WriteResponse(w, op, proto.StatusOK, []byte{proto.WireVersion})
 }
 
-func (s *Server) dispatch(op proto.OpCode, apiKey string, body []byte, w io.Writer) error {
+func (s *Server) dispatch(op proto.OpCode, p auth.Principal, body []byte, w io.Writer) error {
 	switch op {
 	case proto.OpProduce:
-		return s.handleProduce(apiKey, body, w)
+		return s.handleProduce(p, body, w)
 	case proto.OpFetch:
-		return s.handleFetch(apiKey, body, w)
+		return s.handleFetch(p, body, w)
 	case proto.OpMetadata:
 		return s.handleMetadata(body, w)
 	case proto.OpCreateTopic:
@@ -514,34 +540,35 @@ func (s *Server) dispatch(op proto.OpCode, apiKey string, body []byte, w io.Writ
 	case proto.OpSync:
 		return s.handleSync(body, w)
 	case proto.OpProduceBatch:
-		return s.handleProduceBatch(apiKey, body, w)
+		return s.handleProduceBatch(p, body, w)
 	default:
 		return proto.WriteErrorResponse(w, op, proto.StatusInvalidRequest,
 			fmt.Sprintf("unknown opcode 0x%02x", byte(op)))
 	}
 }
 
-func (s *Server) handleProduce(apiKey string, body []byte, w io.Writer) error {
+func (s *Server) handleProduce(p auth.Principal, body []byte, w io.Writer) error {
 	req, err := proto.DecodeProduceRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpProduce, proto.StatusInvalidRequest, err.Error())
 	}
-	if !s.authorizeProduce(apiKey, req.Topic) {
+	// Legacy WithACL check (PR 4 retires the path). Then the new
+	// scope-based authorizer — both must allow.
+	if !s.authorizeProduce(p.Subject, req.Topic) {
 		return proto.WriteErrorResponse(w, proto.OpProduce, proto.StatusForbidden,
 			fmt.Sprintf("not authorized to produce to %q", req.Topic))
 	}
-	if limiter := s.limiterFor(apiKey); limiter != nil {
+	if err := s.authorize(p, auth.ActionProduce, req.Topic); err != nil {
+		return proto.WriteErrorResponse(w, proto.OpProduce, proto.StatusForbidden, err.Error())
+	}
+	if limiter := s.limiterFor(p.Subject); limiter != nil {
 		if !limiter.take(int64(len(req.Record.Value))) {
 			return proto.WriteErrorResponse(w, proto.OpProduce, proto.StatusRateLimited,
 				"produce quota exceeded")
 		}
 	}
 	pref := proto.PartitionRef{Topic: req.Topic, Index: req.Partition}
-	// Attach the Principal so cluster.Apply's audit log names the
-	// originating subject. Account / Scopes ride along once the
-	// connection stores the full Principal — for now Subject (== the
-	// pre-threading apiKey value) is the load-bearing field.
-	ctx := auth.WithPrincipal(context.Background(), auth.Principal{Subject: apiKey})
+	ctx := auth.WithPrincipal(context.Background(), p)
 	offset, err := s.core.Publish(ctx, pref, req.Record)
 	if err != nil {
 		return s.respondError(w, proto.OpProduce, err)
@@ -561,14 +588,17 @@ func (s *Server) respondError(w io.Writer, op proto.OpCode, err error) error {
 	return proto.WriteErrorResponse(w, op, classifyBrokerError(err), err.Error())
 }
 
-func (s *Server) handleFetch(apiKey string, body []byte, w io.Writer) error {
+func (s *Server) handleFetch(p auth.Principal, body []byte, w io.Writer) error {
 	req, err := proto.DecodeFetchRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpFetch, proto.StatusInvalidRequest, err.Error())
 	}
-	if !s.authorizeConsume(apiKey, req.Topic) {
+	if !s.authorizeConsume(p.Subject, req.Topic) {
 		return proto.WriteErrorResponse(w, proto.OpFetch, proto.StatusForbidden,
 			fmt.Sprintf("not authorized to consume from %q", req.Topic))
+	}
+	if err := s.authorize(p, auth.ActionConsume, req.Topic); err != nil {
+		return proto.WriteErrorResponse(w, proto.OpFetch, proto.StatusForbidden, err.Error())
 	}
 	pref := proto.PartitionRef{Topic: req.Topic, Index: req.Partition}
 	deadline := time.Now().Add(time.Duration(req.MaxWaitMs) * time.Millisecond)
@@ -583,7 +613,7 @@ func (s *Server) handleFetch(apiKey string, body []byte, w io.Writer) error {
 			return proto.WriteErrorResponse(w, proto.OpFetch, classifyBrokerError(err), err.Error())
 		}
 		if len(records) > 0 || time.Now().After(deadline) {
-			if limiter := s.fetchLimiterFor(apiKey); limiter != nil && len(records) > 0 {
+			if limiter := s.fetchLimiterFor(p.Subject); limiter != nil && len(records) > 0 {
 				var bytes int64
 				for _, r := range records {
 					bytes += int64(len(r.Value))
@@ -996,20 +1026,23 @@ func (s *Server) handleFetchSegmentChunk(body []byte, w io.Writer) error {
 		proto.FetchSegmentChunkResponse{Bytes: bytes}.Encode())
 }
 
-func (s *Server) handleProduceBatch(apiKey string, body []byte, w io.Writer) error {
+func (s *Server) handleProduceBatch(p auth.Principal, body []byte, w io.Writer) error {
 	req, err := proto.DecodeProduceBatchRequest(body)
 	if err != nil {
 		return proto.WriteErrorResponse(w, proto.OpProduceBatch, proto.StatusInvalidRequest, err.Error())
 	}
-	if !s.authorizeProduce(apiKey, req.Topic) {
+	if !s.authorizeProduce(p.Subject, req.Topic) {
 		return proto.WriteErrorResponse(w, proto.OpProduceBatch, proto.StatusForbidden,
 			fmt.Sprintf("not authorized to produce to %q", req.Topic))
+	}
+	if err := s.authorize(p, auth.ActionProduce, req.Topic); err != nil {
+		return proto.WriteErrorResponse(w, proto.OpProduceBatch, proto.StatusForbidden, err.Error())
 	}
 	if len(req.Records) == 0 {
 		return proto.WriteResponse(w, proto.OpProduceBatch, proto.StatusOK,
 			proto.ProduceBatchResponse{}.Encode())
 	}
-	if limiter := s.limiterFor(apiKey); limiter != nil {
+	if limiter := s.limiterFor(p.Subject); limiter != nil {
 		var totalBytes int64
 		for _, r := range req.Records {
 			totalBytes += int64(len(r.Value))
@@ -1020,7 +1053,7 @@ func (s *Server) handleProduceBatch(apiKey string, body []byte, w io.Writer) err
 		}
 	}
 	pref := proto.PartitionRef{Topic: req.Topic, Index: req.Partition}
-	ctx := auth.WithPrincipal(context.Background(), auth.Principal{Subject: apiKey})
+	ctx := auth.WithPrincipal(context.Background(), p)
 	baseOffset, err := s.core.Publish(ctx, pref, req.Records[0])
 	if err != nil {
 		return s.respondError(w, proto.OpProduceBatch, err)
