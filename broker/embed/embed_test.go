@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jedi-knights/holocron/broker/embed"
+	"github.com/jedi-knights/holocron/broker/internal/auth"
 	"github.com/jedi-knights/holocron/proto"
 	"github.com/jedi-knights/holocron/sdk"
 	holocronnet "github.com/jedi-knights/holocron/sdk/net"
@@ -1987,38 +1988,26 @@ func TestDeleteTopic_ClearsRecordsAndAllowsReuse(t *testing.T) {
 }
 
 // TestACL_EnforcesPerTopicPermissions proves the per-topic
-// authorization layer: a key restricted to {Produce: ["allowed"]}
-// can publish to "allowed", but produces to "other" and consumes
-// from "allowed" both fail with a forbidden error.
+// authorization layer: a JWT carrying only "produce:allowed" can
+// publish to "allowed", but produces to "other" and consumes from
+// "allowed" both fail with a forbidden error.
 //
-// Authentication (WithAPIKeys) gates which keys can connect at all;
-// authorization (WithACL) gates what each key can do once admitted.
-// Without this layer, a single API key would have full access to
-// every topic.
+// JWT verification (WithAuthVerifier) gates which credentials can
+// connect at all; the auto-installed ScopeAuthorizer then gates
+// what each authenticated principal can do based on its
+// holocron.scopes claim. The pre-PR-4 alternative — embed.WithACL
+// keyed by Subject — was retired in favour of this single-source
+// model so credentials and policy travel together.
 func TestACL_EnforcesPerTopicPermissions(t *testing.T) {
 	// Arrange
-	b := embed.NewMemory()
-	defer b.Close()
-	if err := b.CreateTopic(embed.TopicSpec{Name: "allowed", PartitionCount: 1}); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.CreateTopic(embed.TopicSpec{Name: "other", PartitionCount: 1}); err != nil {
-		t.Fatal(err)
-	}
-	addr, err := b.Listen("127.0.0.1:0",
-		embed.WithAPIKeys("k1"),
-		embed.WithACL(map[string]embed.ACL{
-			"k1": {Produce: []string{"allowed"}},
-		}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tr, err := holocronnet.Dial(addr, holocronnet.WithCredential(sdk.APIKeyCredential("k1")))
-	if err != nil {
-		t.Fatal(err)
-	}
+	pub, priv := mustEd25519Keypair(t)
+	addr := startVerifierBroker(t, pub, "allowed", "other")
+	token := mustIssueJWT(t, priv, auth.Claims{
+		Subject: "k1",
+		Scopes:  []string{"produce:allowed"},
+		Expires: time.Now().Add(time.Hour).Unix(),
+	})
+	tr := mustDialWithJWT(t, addr, token)
 	defer tr.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -2039,7 +2028,7 @@ func TestACL_EnforcesPerTopicPermissions(t *testing.T) {
 		t.Fatal("produce to non-permitted topic succeeded — ACL not enforced")
 	}
 
-	// Consume from allowed: forbidden (no consume permission).
+	// Consume from allowed: forbidden (no consume scope).
 	c, err := sdk.NewConsumer(tr)
 	if err != nil {
 		t.Fatal(err)

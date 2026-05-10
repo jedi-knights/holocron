@@ -450,15 +450,7 @@ type listenOpts struct {
 	apiKeys   []string
 	verifier  auth.TokenVerifier
 	quotas    map[string]server.Quota
-	acls      map[string]server.ACL
 }
-
-// ACL is re-exported from the internal server package so callers can
-// build per-key authorization tables without importing internal/.
-// Produce and Consume each list the topics the API key may publish
-// to or read from. A list containing the wildcard "*" grants the
-// permission on every topic; an empty list denies all.
-type ACL = server.ACL
 
 // WithTLS wraps the broker's wire-protocol listener in TLS using the
 // supplied config. Producer + consumer SDK callers must dial with
@@ -507,19 +499,6 @@ func WithQuotas(quotas map[string]Quota) ListenOption {
 	return func(o *listenOpts) { o.quotas = quotas }
 }
 
-// WithACL declares per-API-key authorization. Each entry lists the
-// topics the key may produce to and consume from. Without an
-// associated ACL the key is denied on every topic-bound operation;
-// keys not configured at all (the WithAPIKeys deny-all path) are
-// rejected at handshake before authorization runs.
-//
-// Authentication answers "who is calling"; authorization answers
-// "what they may do." Layer them deliberately: WithAPIKeys is the
-// gate; WithACL is the lock pattern behind it.
-func WithACL(acls map[string]ACL) ListenOption {
-	return func(o *listenOpts) { o.acls = acls }
-}
-
 // Listen starts a network listener on addr (":9092", ":0", etc.) so
 // remote producers and consumers can connect. The listener runs until
 // the Broker is Closed. Returns the bound address — useful when addr
@@ -559,9 +538,6 @@ func (b *Broker) Listen(addr string, opts ...ListenOption) (string, error) {
 	}
 	if len(cfg.quotas) > 0 {
 		srv.SetQuotas(cfg.quotas)
-	}
-	if len(cfg.acls) > 0 {
-		srv.SetACL(cfg.acls)
 	}
 	b.srv = srv
 	b.mu.Unlock()
