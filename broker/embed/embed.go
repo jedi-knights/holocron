@@ -546,6 +546,14 @@ func (b *Broker) Listen(addr string, opts ...ListenOption) (string, error) {
 		return "", errors.New("embed: WithAPIKeys and WithAuthVerifier are mutually exclusive")
 	case cfg.verifier != nil:
 		srv.SetVerifier(cfg.verifier)
+		// Auth-required mode: install a deny-by-default authorizer so
+		// JWT scopes (holocron.scopes) actually gate produce / consume.
+		// Without this the broker authenticates but admits everything,
+		// which is the behaviour PR 1 of the ACL wave was designed to
+		// close. Operators who want the legacy admit-all behaviour
+		// despite a verifier being set can override via the (future)
+		// WithAuthorizer option.
+		srv.SetAuthorizer(auth.ScopeAuthorizer{})
 	case len(cfg.apiKeys) > 0:
 		srv.SetAPIKeys(cfg.apiKeys)
 	}

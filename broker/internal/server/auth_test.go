@@ -25,14 +25,14 @@ func TestServer_Handshake_AnonymousByDefault(t *testing.T) {
 	})
 
 	// Act
-	apiKey, err := s.handshake(in, out)
+	p, err := s.handshake(in, out)
 
 	// Assert
 	if err != nil {
 		t.Fatalf("handshake: %v", err)
 	}
-	if apiKey != "" {
-		t.Errorf("apiKey: got %q, want empty (Anonymous principal)", apiKey)
+	if p.Subject != "" {
+		t.Errorf("Principal.Subject: got %q, want empty (Anonymous principal)", p.Subject)
 	}
 }
 
@@ -63,14 +63,14 @@ func TestServer_Handshake_AcceptsValidJWT(t *testing.T) {
 	})
 
 	// Act
-	apiKey, err := s.handshake(in, out)
+	p, err := s.handshake(in, out)
 
 	// Assert
 	if err != nil {
 		t.Fatalf("handshake: %v", err)
 	}
-	if apiKey != "alice" {
-		t.Errorf("apiKey: got %q, want %q (= Principal.Subject)", apiKey, "alice")
+	if p.Subject != "alice" {
+		t.Errorf("Principal.Subject: got %q, want %q (= Principal.Subject)", p.Subject, "alice")
 	}
 }
 
@@ -140,12 +140,12 @@ func TestServer_SetAPIKeys_RoutesThroughAPIKeyVerifier(t *testing.T) {
 		CredentialKind: proto.CredentialAPIKey,
 		Credential:     []byte("alpha"),
 	})
-	apiKey, err := s.handshake(in, out)
+	p, err := s.handshake(in, out)
 	if err != nil {
 		t.Fatalf("handshake(valid key): %v", err)
 	}
-	if apiKey != "alpha" {
-		t.Errorf("apiKey: got %q, want %q", apiKey, "alpha")
+	if p.Subject != "alpha" {
+		t.Errorf("Principal.Subject: got %q, want %q", p.Subject, "alpha")
 	}
 
 	// Act / Assert: invalid key rejected.
