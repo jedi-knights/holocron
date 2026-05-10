@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"time"
+
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 )
 
 // runPing performs a quick liveness/auth probe against a broker:
@@ -27,11 +29,16 @@ func runPing(args []string) error {
 	apiKey := fs.String("api-key", "", "API key for handshake")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 2*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", *addr, err)
 	}

@@ -167,8 +167,36 @@ The default verification expects the peer cert's SAN to include the address bein
 | `--cluster-tls-ca` | `HOLOCRON_CLUSTER_TLS_CA` | — | PEM CA bundle that signs every peer's cert. Required when cert + key are supplied. |
 | `--cluster-tls-server-name` | `HOLOCRON_CLUSTER_TLS_SERVER_NAME` | — | Expected SAN on peer certs when dialing. Only needed when peer certs do not carry their bind addresses. |
 
+## Operator CLI (`holocronctl`)
+
+Every `holocronctl` subcommand accepts the same four TLS flags so the operator workflow against a TLS broker matches the plaintext one with a single extra flag (or env var):
+
+| Flag | Env | Purpose |
+|---|---|---|
+| `--tls-ca` | `HOLOCRON_TLS_CA` | PEM CA bundle for verifying the broker's cert (enables TLS) |
+| `--tls-cert` | `HOLOCRON_TLS_CERT` | PEM client cert for mTLS (paired with `--tls-key`) |
+| `--tls-key` | `HOLOCRON_TLS_KEY` | PEM private key matching `--tls-cert` |
+| `--tls-skip-verify` | — | Disable broker-cert verification (lab use only) |
+
+```bash
+# One-off probe with explicit CA
+holocronctl ping --addr broker.example.com:9092 --tls-ca /etc/holocron/ca.pem
+
+# Set once, use everywhere
+export HOLOCRON_TLS_CA=/etc/holocron/ca.pem
+holocronctl topic list --addr broker.example.com:9092
+holocronctl group describe --addr broker.example.com:9092 --group ingest
+holocronctl cluster status --addr broker.example.com:9092
+
+# Required-mTLS broker
+holocronctl topic create --addr broker.example.com:9092 \
+  --topic events --partitions 4 \
+  --tls-ca ca.pem --tls-cert ops-client.pem --tls-key ops-client-key.pem
+```
+
+`--tls-cert` and `--tls-key` must be supplied together; the CLI rejects half-supplied client material before dialing.
+
 ## Limitations and roadmap
 
-- **Cert rotation requires a restart.** Cert material is read once at startup. Hot-reload on `SIGHUP` is a planned follow-on after PR 6.
-- **`holocronctl` does not yet accept TLS flags.** PR 6 closes this — until then, operator commands against a TLS broker need a wrapper that supplies a TLS-aware transport.
+- **Cert rotation requires a restart.** Cert material is read once at startup; hot-reload on `SIGHUP` is the next planned follow-on.
 - **No client cert → identity mapping yet.** Required mTLS confirms the client holds a cert signed by the configured CA but does not yet derive an authenticated principal from it. JWT/account-based auth is the next item in Wave 1 after the TLS sequence completes.

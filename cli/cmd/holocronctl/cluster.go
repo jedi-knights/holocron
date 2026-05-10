@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"time"
+
+	"github.com/jedi-knights/holocron/cli/internal/clienttls"
 )
 
 // runCluster dispatches `cluster <subcommand>`.
@@ -37,11 +39,16 @@ func runClusterStatus(args []string) error {
 	apiKey := fs.String("api-key", "", "API key for handshake")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -76,11 +83,16 @@ func runClusterMembers(args []string) error {
 	addr := fs.String("addr", "127.0.0.1:9092", "broker address")
 	apiKey := fs.String("api-key", "", "API key for handshake")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -109,6 +121,7 @@ func runClusterJoin(args []string) error {
 	id := fs.String("id", "", "ID of the voter to add (required)")
 	peerAddr := fs.String("peer-addr", "", "Raft RPC address of the peer (required)")
 	timeout := fs.Duration("timeout", 10*time.Second, "RPC timeout (AddVoter blocks until commit)")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -116,7 +129,11 @@ func runClusterJoin(args []string) error {
 		return errors.New("cluster join: --id and --peer-addr are required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -137,6 +154,7 @@ func runClusterLeave(args []string) error {
 	apiKey := fs.String("api-key", "", "API key for handshake")
 	id := fs.String("id", "", "ID of the voter to remove (required)")
 	timeout := fs.Duration("timeout", 10*time.Second, "RPC timeout")
+	tlsCfg := clienttls.RegisterFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -144,7 +162,11 @@ func runClusterLeave(args []string) error {
 		return errors.New("cluster leave: --id is required")
 	}
 
-	tr, err := dial(*addr, *apiKey)
+	cfg, err := tlsCfg()
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
 	if err != nil {
 		return err
 	}
