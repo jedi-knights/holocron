@@ -319,3 +319,110 @@ func TestIsStatus(t *testing.T) {
 		t.Fatal("IsStatus matched wrong status")
 	}
 }
+
+func TestWireVersion_IsTen(t *testing.T) {
+	// Wire v10 is the first version carrying CredentialKind on the
+	// handshake. A regression that bumped it back would cause every
+	// PR 5+ client to silently lose credentials.
+	if WireVersion != 10 {
+		t.Errorf("WireVersion: got %d, want 10", WireVersion)
+	}
+}
+
+func TestCredentialKind_Constants(t *testing.T) {
+	// The numeric values are wire-stable: PR 1 (broker/internal/auth)
+	// chose the same encoding so the server-side conversion is a
+	// no-op cast. Changing these breaks the auth package's contract.
+	cases := []struct {
+		name string
+		got  CredentialKind
+		want uint8
+	}{
+		{"None", CredentialNone, 0},
+		{"APIKey", CredentialAPIKey, 1},
+		{"JWT", CredentialJWT, 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if uint8(c.got) != c.want {
+				t.Errorf("got %d, want %d", c.got, c.want)
+			}
+		})
+	}
+}
+
+func TestHandshakeRequest_RoundTripJWT(t *testing.T) {
+	// Arrange
+	req := HandshakeRequest{
+		Version:        WireVersion,
+		Credential:     []byte("eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhbGljZSJ9.signature"),
+		CredentialKind: CredentialJWT,
+	}
+
+	// Act
+	got, err := DecodeHandshakeRequest(req.Encode())
+	if err != nil {
+		t.Fatalf("DecodeHandshakeRequest: %v", err)
+	}
+
+	// Assert
+	if got.Version != req.Version {
+		t.Errorf("Version: got %d, want %d", got.Version, req.Version)
+	}
+	if got.CredentialKind != CredentialJWT {
+		t.Errorf("CredentialKind: got %d, want CredentialJWT", got.CredentialKind)
+	}
+	if !bytes.Equal(got.Credential, req.Credential) {
+		t.Errorf("Credential: got %q, want %q", got.Credential, req.Credential)
+	}
+}
+
+func TestHandshakeRequest_RoundTripAPIKey(t *testing.T) {
+	// Arrange
+	req := HandshakeRequest{
+		Version:        WireVersion,
+		Credential:     []byte("legacy-api-key-value"),
+		CredentialKind: CredentialAPIKey,
+	}
+
+	// Act
+	got, err := DecodeHandshakeRequest(req.Encode())
+	if err != nil {
+		t.Fatalf("DecodeHandshakeRequest: %v", err)
+	}
+
+	// Assert
+	if got.CredentialKind != CredentialAPIKey {
+		t.Errorf("CredentialKind: got %d, want CredentialAPIKey", got.CredentialKind)
+	}
+	if string(got.Credential) != "legacy-api-key-value" {
+		t.Errorf("Credential: got %q", got.Credential)
+	}
+}
+
+func TestHandshakeRequest_RoundTripNone(t *testing.T) {
+	// Arrange: anonymous handshake — no credential.
+	req := HandshakeRequest{Version: WireVersion}
+
+	// Act
+	got, err := DecodeHandshakeRequest(req.Encode())
+	if err != nil {
+		t.Fatalf("DecodeHandshakeRequest: %v", err)
+	}
+
+	// Assert
+	if got.CredentialKind != CredentialNone {
+		t.Errorf("CredentialKind: got %d, want CredentialNone", got.CredentialKind)
+	}
+	if len(got.Credential) != 0 {
+		t.Errorf("Credential: got %q, want empty", got.Credential)
+	}
+}
+
+func TestDecodeHandshakeRequest_RejectsTruncated(t *testing.T) {
+	// Arrange / Act / Assert: empty buffer cannot carry even the
+	// version byte.
+	if _, err := DecodeHandshakeRequest(nil); err == nil {
+		t.Fatal("expected error for empty handshake buffer")
+	}
+}

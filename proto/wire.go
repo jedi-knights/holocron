@@ -45,7 +45,13 @@ var wireCRCTable = crc32.MakeTable(crc32.Castagnoli)
 //	v9: DeleteGroup — operator-driven removal of a group and
 //	    every committed offset under it. Pairs with the cleanup
 //	    workflow surfaced by `holocronctl group delete`.
-const WireVersion uint8 = 9
+//	v10: HandshakeRequest replaces the opaque APIKey string with
+//	    a kind-tagged Credential ([]byte + CredentialKind), the
+//	    foundation for JWT-bearing handshakes. The legacy API-key
+//	    bearer is still encodable via CredentialKind=APIKey for
+//	    a pre-alpha transition window; verifier policy moves into
+//	    broker/internal/auth in PR 3.
+const WireVersion uint8 = 10
 
 // OpCode names a request type. Responses echo the same opcode.
 type OpCode uint8
@@ -243,18 +249,40 @@ func ReadResponse(r io.Reader, op OpCode) ([]byte, error) {
 
 // ===== Request / Response payload types =====
 
+// CredentialKind tags the format of HandshakeRequest.Credential. The
+// numeric values are wire-stable: broker/internal/auth uses the same
+// encoding so the server-side conversion at handshake time is a
+// no-op cast.
+type CredentialKind uint8
+
+const (
+	// CredentialNone is the absence of a credential — anonymous
+	// access. The broker accepts it when no auth flag is configured;
+	// rejects it when any auth flag is set.
+	CredentialNone CredentialKind = 0
+	// CredentialAPIKey is the legacy opaque bearer token. Carried
+	// through wire v10 as a transition shape; superseded by
+	// CredentialJWT for any new deployment.
+	CredentialAPIKey CredentialKind = 1
+	// CredentialJWT is an EdDSA-signed JWT verified by
+	// broker/internal/auth.Ed25519Verifier. The standard kind for
+	// authenticated v1 deployments.
+	CredentialJWT CredentialKind = 2
+)
+
 // HandshakeRequest is the first message on every connection. Beyond
-// the wire version (used for compatibility checking), it carries an
-// optional API key — brokers configured with an allow-list of keys
-// reject connections that don't present a matching one.
+// the wire version (used for compatibility checking), it carries the
+// client's authentication credential — a kind-tagged byte slice the
+// broker passes to its configured TokenVerifier.
 type HandshakeRequest struct {
-	Version uint8
-	APIKey  string
+	Version        uint8
+	CredentialKind CredentialKind
+	Credential     []byte
 }
 
 func (h HandshakeRequest) Encode() []byte {
-	b := []byte{h.Version}
-	b = encodeString(b, h.APIKey)
+	b := []byte{h.Version, byte(h.CredentialKind)}
+	b = encodeBytes(b, h.Credential)
 	return b
 }
 
@@ -265,15 +293,23 @@ func DecodeHandshakeRequest(b []byte) (HandshakeRequest, error) {
 	version := b[0]
 	rest := b[1:]
 	if len(rest) == 0 {
-		// v1–v3 compatibility — no API key field. Allowed only when
-		// the local WireVersion check itself rejects the older client.
+		// Pre-v10 compatibility — no credential field. Allowed
+		// because the local WireVersion check itself rejects the
+		// older client, so this path only fires once before the
+		// version mismatch error surfaces.
 		return HandshakeRequest{Version: version}, nil
 	}
-	key, _, err := decodeString(rest)
+	kind := CredentialKind(rest[0])
+	rest = rest[1:]
+	cred, _, err := decodeBytes(rest)
 	if err != nil {
-		return HandshakeRequest{}, fmt.Errorf("proto: handshake api key: %w", err)
+		return HandshakeRequest{}, fmt.Errorf("proto: handshake credential: %w", err)
 	}
-	return HandshakeRequest{Version: version, APIKey: key}, nil
+	return HandshakeRequest{
+		Version:        version,
+		CredentialKind: kind,
+		Credential:     cred,
+	}, nil
 }
 
 // ProduceRequest carries a single record to be appended.
