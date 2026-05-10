@@ -53,6 +53,71 @@ func TestRun_AuthIssue_NonPositiveTTL(t *testing.T) {
 	}
 }
 
+func TestRun_AuthIssue_AllAccessExpandsToWildcardScopes(t *testing.T) {
+	// --all-access is the dev/ops convenience: equivalent to writing
+	// --scope produce:* --scope consume:* --scope admin:* by hand.
+	// The issued token must carry exactly those three scopes so the
+	// broker's ScopeAuthorizer admits any produce / consume / admin
+	// action.
+	keyPath := writeEd25519PrivateKeyPEM(t)
+	out := filepath.Join(t.TempDir(), "all-access.jwt")
+	err := run([]string{
+		"auth", "issue",
+		"--key", keyPath,
+		"--subject", "dev-laptop",
+		"--all-access",
+		"--ttl", "1h",
+		"--output", out,
+	})
+	if err != nil {
+		t.Fatalf("auth issue --all-access: %v", err)
+	}
+
+	tokenBytes, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read token: %v", err)
+	}
+	token := strings.TrimSpace(string(tokenBytes))
+	claims, _, err := cliauth.DecodeClaimsUnverified([]byte(token))
+	if err != nil {
+		t.Fatalf("DecodeClaimsUnverified: %v", err)
+	}
+	want := map[string]bool{"produce:*": false, "consume:*": false, "admin:*": false}
+	for _, s := range claims.Scopes {
+		if _, ok := want[s]; ok {
+			want[s] = true
+		}
+	}
+	for s, found := range want {
+		if !found {
+			t.Errorf("scope %q missing from --all-access token; got Scopes=%v", s, claims.Scopes)
+		}
+	}
+	if len(claims.Scopes) != 3 {
+		t.Errorf("Scopes: got %d, want 3 (produce:*, consume:*, admin:*)", len(claims.Scopes))
+	}
+}
+
+func TestRun_AuthIssue_AllAccessRejectsExplicitScope(t *testing.T) {
+	// --all-access and --scope are mutually exclusive — combining
+	// them is almost always operator confusion. Surface the error
+	// at parse time so the operator sees the contradiction.
+	keyPath := writeEd25519PrivateKeyPEM(t)
+	err := run([]string{
+		"auth", "issue",
+		"--key", keyPath,
+		"--subject", "dev-laptop",
+		"--all-access",
+		"--scope", "produce:events",
+	})
+	if err == nil {
+		t.Fatal("expected error when --all-access combined with --scope")
+	}
+	if !strings.Contains(err.Error(), "all-access") {
+		t.Errorf("expected error to mention --all-access, got %q", err)
+	}
+}
+
 func TestRun_AuthIssue_WritesToOutputFile(t *testing.T) {
 	// Arrange
 	keyPath := writeEd25519PrivateKeyPEM(t)
