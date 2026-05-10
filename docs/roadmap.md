@@ -22,9 +22,9 @@ Without these, no real production user can deploy Holocron. This wave is the gat
 
 - [ ] **Stage 9 — Fresh-follower record catch-up.** Currently paused after M4; offset-gap scenario tracked in [`stage-9.md`](stage-9.md).
 - [x] **TLS** for client and intra-cluster traffic. Server TLS, optional/required mTLS for clients, mandatory mTLS for Raft. See [`tls.md`](tls.md).
-- [ ] **Authentication** — JWT/NKey-style credentials, scoped tokens for producers and consumers.
-- [ ] **ACLs** — per-topic publish/subscribe authorization.
-- [ ] **Multi-tenancy isolation** — account/namespace-level resource limits and topic visibility.
+- [x] **Authentication** — Ed25519-signed JWT credentials, scoped tokens for producers and consumers, denylist with SIGHUP reload, `holocronctl auth issue` / `inspect`. See [`auth.md`](auth.md).
+- [x] **ACLs** — per-topic publish/subscribe + admin authorization driven by JWT `holocron.scopes` claims. Three verbs (produce/consume/admin), prefix wildcards, deny by default when auth is configured. See [`authorization.md`](authorization.md).
+- [ ] **Multi-tenancy isolation** — account/namespace-level resource limits and topic visibility. The `holocron.account` claim is already plumbed; this wave adds enforcement.
 - [ ] **Cert hot-reload on `SIGHUP`** — small follow-on to the TLS work; closes the rotation gap.
 
 ## Wave 2 — Layered stores (closes NATS's most-used API surface)
