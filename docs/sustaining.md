@@ -181,7 +181,7 @@ of its own. They are documented in
 2. Avro / Protobuf schema parsing for richer registry compatibility
 3. Linux `sendfile(2)` fast path for sealed-segment Fetch
 4. Per-partition Raft for write-throughput scaling
-5. Continuous cluster replication for records (streaming follower)
+5. Continuous cluster replication / fresh-follower record catch-up — **Stage 9 M1–M4 shipped foundation; M5+ paused** (see [`stage-9.md`](stage-9.md))
 6. Multiplexed connections with correlation IDs
 
 These are known shape, not roadmap commitments. The codebase is at a

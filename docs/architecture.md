@@ -103,7 +103,7 @@ their own:
 | Schema registry | Avro / Protobuf parsing with type/default/nesting compatibility | Needs a real schema parser; batch 27 ships a structural required-field check that catches the common cases |
 | Broker storage | Linux `sendfile(2)` fast path | Disk and wire formats already align (batch 5); needs a build-tagged splice path with compression-aware fallback |
 | Cluster | Per-partition Raft | Decouples write throughput from a single leader; meaningful refactor of the cluster module |
-| Cluster | Continuous follower replication | Batch 22 ships a one-shot snapshot; long-lived replication needs a streaming follower mode tracking the leader's log |
+| Cluster | Continuous follower replication / fresh-follower record catch-up | **Partial: Stage 9 M1–M4 shipped foundation (wire format, dedup guard, sync helper, orchestrator API). M5+ paused** — implementation surfaced an offset-alignment problem the original design didn't address. See [`stage-9.md#implementation-status`](stage-9.md#implementation-status). |
 | Wire protocol | Multiplexed connections (correlation IDs, ordered demux) | One-RPC-per-connection today; multiplexing reduces connection churn at the cost of demux complexity |
 
 These are documented as known shape, not roadmap commitments. The

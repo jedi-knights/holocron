@@ -7,7 +7,7 @@ A from-scratch, append-only event streaming platform — built to understand how
 ![Go](https://img.shields.io/badge/go-1.23+-00ADD8?logo=go)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Status:** Feature-frozen at end of the sustaining era (batches 21–52). The eight roadmap stages are complete and ~96 polish/ergonomics items have landed across SDK, CLI, streams, and observability surface. The remaining six backlog items are large architectural pieces (exactly-once, per-partition Raft, sendfile, continuous replication, multiplexed connections, richer schema parsing) that are documented in [`docs/sustaining.md#deferred-work`](docs/sustaining.md#deferred-work) but not on a roadmap. The on-disk format, wire protocol, and public APIs will change without notice until the first tagged release.
+> **Status:** Feature-frozen at end of the sustaining era (batches 21–52); Stage 9 (fresh-follower record catch-up) is **partially complete and paused** — see [`docs/stage-9.md#implementation-status`](docs/stage-9.md#implementation-status). The eight roadmap stages are complete and ~96 polish/ergonomics items have landed across SDK, CLI, streams, and observability surface. The remaining backlog items are large architectural pieces (exactly-once, per-partition Raft, sendfile, continuous replication completion, multiplexed connections, richer schema parsing) documented in [`docs/sustaining.md#deferred-work`](docs/sustaining.md#deferred-work) but not on a roadmap. The on-disk format, wire protocol, and public APIs will change without notice until the first tagged release.
 
 ## Table of contents
 

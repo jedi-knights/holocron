@@ -1,5 +1,13 @@
 # Stage 9 — Fresh-follower record catch-up
 
+> **Status: partial. M1–M4 shipped; M5+ deferred.** Implementation
+> uncovered an offset-alignment problem the original design didn't
+> address — see [Implementation status](#implementation-status) at
+> the bottom of this doc. The foundation pieces (wire format,
+> dedup guard, sync helper, orchestrator API) are in place; closing
+> the truncation gap requires a Store-interface refactor that's
+> larger than the original 2-week estimate.
+
 Stage 9 closes a gap in the Stage 5 cluster: a node joining a
 long-running cluster cannot reliably catch up on historical records
 once the leader's Raft log has been snapshot-truncated. The fix is
@@ -209,3 +217,73 @@ to be designed end-to-end:
 Roughly two weeks of focused work — substantially more than a
 single sustaining batch, which is why Stage 9 gets its own design
 note before any code lands.
+
+## Implementation status
+
+Stage 9 was attempted as six milestones (M1–M6). M1–M4 shipped;
+M5+ are deferred. The original 2-week estimate proved low because
+implementation surfaced a problem the design didn't address.
+
+### What shipped (M1–M4)
+
+| Milestone | Commit | What landed |
+|---|---|---|
+| M1 | `463727c` | `AppendCommand.Offset int64` field with encode/decode round-trip; wire format gains 8 bytes per Raft Append entry. No behavior change. |
+| M2 | `e31ae4c` | `OffsetUnstamped int64 = -1` sentinel + `FSM.applyAppend` dedup guard that skips `store.Append` when `cmd.Offset < local.HighWater`. `publishClustered` stamps `OffsetUnstamped` so the steady-state cluster path is unaffected. |
+| M3 | `7bf8bee` | `cluster.SyncPartitionFromPeer` standalone helper: streams records from a peer's partition into a local `storage.Store` via the wire-protocol Subscribe path until the local high-water reaches the peer's. Goes directly through `Store`, bypassing the FSM. |
+| M4 | `c8262be` | `embed.Broker.SyncFromLeader(ctx, peer)` orchestrator that iterates the local registry's topics and runs `SyncPartitionFromPeer` per partition. End-to-end test: donor broker with records → fresh recipient → SyncFromLeader → recipient serves all records. Plus `Cluster.Snapshot()` helper for forcing a Raft snapshot in future tests. |
+
+### What's blocked: the offset-alignment problem
+
+The design assumed Raft's log replay on a fresh follower could be
+dovetailed with `SyncFromLeader` via the dedup guard. Implementation
+surfaced a real problem this missed:
+
+`storage.Store.Append` assigns sequential offsets starting from the
+current high-water. When a fresh follower's Raft replay calls
+`FSM.applyAppend` with `cmd.Offset=40` and the local store is
+empty, `store.Append` writes the record at local offset **0**, not
+40. The local store ends up with the record's *value* at the wrong
+*offset*. Any subsequent `SyncFromLeader` reading offsets 0-49
+from the peer makes things worse — those records get appended at
+local offsets 10, 11, ... while local offsets 0-9 still hold the
+wrong-position replay records.
+
+### Why M5+ requires more than originally estimated
+
+The fix isn't a tweak to the cutover — it's a Store-interface
+addition. Three changes the original design didn't account for:
+
+1. **Offset-aware writes.** Add `AppendAt(p, expectedOffset, r)` to
+   the `Store` interface, fail if `expectedOffset != next-to-append`.
+   Implement on `MemoryStore` and `FileStore` (the latter via
+   `PartitionLog`). FSM.applyAppend uses `AppendAt` when
+   `cmd.Offset != OffsetUnstamped`.
+2. **Sync-before-replay ordering.** Even with `AppendAt`, the
+   ordering matters: `SyncFromLeader` has to fill 0-49 BEFORE
+   Raft replays log entries 30-49 (which would otherwise fail
+   `AppendAt` on an empty store with `expectedOffset=30`). This
+   needs a "delay Apply" hook in the cluster lifecycle that
+   `hashicorp/raft` doesn't expose cleanly — likely requires a
+   custom FSM state machine that buffers Apply calls during catch-up.
+3. **Leader-side offset stamping.** `publishClustered` has to
+   predict the next offset under the partition lock and stamp the
+   command before submitting to Raft. Doable, but the lock-hold
+   spans a Raft round-trip.
+
+### What this means
+
+The M1–M4 work isn't wasted. Any future completion of Stage 9 will
+need exactly the wire field, sentinel, dedup guard, sync helper,
+and orchestrator that shipped. They're load-bearing foundation.
+
+But "completion" requires the three additional pieces above, which
+is at least another 1–2 weeks of focused work and one more design
+pass to confirm the sync-before-replay ordering is achievable
+within `hashicorp/raft`'s lifecycle.
+
+For now, Stage 9 is paused. The deferred-work entry in
+`architecture.md` is updated to reflect partial completion. The
+sustaining-era freeze documented in `sustaining.md` stands — the
+codebase remains feature-frozen with Stage 9 as the one
+in-flight-but-paused stage on top.
