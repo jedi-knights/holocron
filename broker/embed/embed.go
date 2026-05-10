@@ -70,6 +70,13 @@ type ClusterConfig struct {
 	AdvertiseAddr string        // address peers should dial; defaults to BindAddr
 	Peers         []ClusterPeer // initial cluster membership
 	Bootstrap     bool          // true on the first node only
+
+	// TLSConfig, when non-nil, encrypts the inter-node Raft transport.
+	// The same *tls.Config is used for both inbound (listener) and
+	// outbound (dial) handshakes, so it must carry a cert chain plus a
+	// trust root that satisfies both directions. Nil keeps the
+	// plaintext Raft transport (suitable only for closed networks).
+	TLSConfig *tls.Config
 }
 
 // NewMemory returns a Broker backed by an in-memory store. Topic metadata,
@@ -221,6 +228,7 @@ func NewDisk(dir string, opts ...DiskOption) (*Broker, error) {
 			DataDir:       filepath.Join(dir, "raft"),
 			Peers:         peers,
 			Bootstrap:     cfg.cluster.Bootstrap,
+			TLSConfig:     cfg.cluster.TLSConfig,
 		}, fsm)
 		if err != nil {
 			return nil, err
