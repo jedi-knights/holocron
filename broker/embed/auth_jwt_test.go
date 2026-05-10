@@ -38,6 +38,11 @@ func TestEmbed_JWTAuth_AcceptsValidToken(t *testing.T) {
 
 	b := embed.NewMemory()
 	defer b.Close()
+	// Pre-create the topic via the embed handle so the JWT under
+	// test (no admin scope) can still produce/consume.
+	if err := b.CreateTopic(embed.TopicSpec{Name: "events", PartitionCount: 1}); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
 	addr, err := b.Listen("127.0.0.1:0", embed.WithAuthVerifier(verifier))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -50,13 +55,13 @@ func TestEmbed_JWTAuth_AcceptsValidToken(t *testing.T) {
 	}
 	defer tr.Close()
 
+	// Assert: handshake-and-RPC round-trip works end-to-end.
+	// ListTopics is the cheapest call that exercises both — and it's
+	// not gated by ACL.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-
-	// Assert: a metadata RPC succeeds — handshake passed and the
-	// connection is usable.
-	if err := tr.CreateTopic(ctx, "events", 1); err != nil {
-		t.Fatalf("CreateTopic: %v", err)
+	if _, err := tr.ListTopics(ctx); err != nil {
+		t.Fatalf("ListTopics: %v", err)
 	}
 }
 
