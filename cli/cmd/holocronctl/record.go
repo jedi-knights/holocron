@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/jedi-knights/holocron/cli/internal/clienttls"
@@ -39,6 +40,7 @@ func runRecordFetch(args []string) error {
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON (same shape as topic dump)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -50,7 +52,11 @@ func runRecordFetch(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}

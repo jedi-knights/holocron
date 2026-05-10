@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/jedi-knights/holocron/cli/internal/clienttls"
@@ -35,6 +36,7 @@ func runTopicCopy(args []string) error {
 	allPartitions := fs.Bool("all-partitions", false, "copy every partition of source instead of just one")
 	timeout := fs.Duration("timeout", 30*time.Second, "RPC timeout (covers the full copy)")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -49,7 +51,11 @@ func runTopicCopy(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}

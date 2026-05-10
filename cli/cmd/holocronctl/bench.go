@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -38,6 +39,7 @@ func runBench(args []string) error {
 	pollSize := fs.Int("poll-size", 256, "consume mode: max records per Poll call")
 	timeout := fs.Duration("timeout", 60*time.Second, "overall run timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -58,7 +60,11 @@ func runBench(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	dialOptsSlice, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, dialOptsSlice...)
 	if err != nil {
 		return err
 	}
@@ -106,7 +112,7 @@ func runBench(args []string) error {
 			// Each producer dials its own connection so the
 			// concurrent load actually parallelizes on the wire
 			// rather than serializing through one socket.
-			myTr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+			myTr, err := dial(*addr, dialOptsSlice...)
 			if err != nil {
 				results[idx] = producerResult{err: fmt.Errorf("producer %d dial: %w", idx, err)}
 				return

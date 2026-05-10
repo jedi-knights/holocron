@@ -67,6 +67,7 @@ func runProduce(args []string) error {
 	var headers headerFlag
 	fs.Var(&headers, "header", "header in key=value form (repeatable; applies to every record)")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -78,7 +79,11 @@ func runProduce(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}

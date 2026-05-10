@@ -78,7 +78,49 @@ A JWT is a base64url-encoded `header.payload.signature` triple. The header decla
 | `holocron.account` | optional | Tenant the subject belongs to. Inert in v1; carried for forward compatibility with multi-tenancy. |
 | `holocron.scopes` | optional | List of `verb:resource` permissions (e.g. `produce:events`). Inert in v1 (no authorization yet); carried for forward compatibility. |
 
-A `holocronctl auth issue` subcommand for signing tokens lands in PR 6 of the auth wave. Until then, any Go program can issue a token with `auth.IssueJWT(privateKey, claims)`.
+### Issuing with `holocronctl auth issue`
+
+The CLI signs a JWT directly:
+
+```bash
+holocronctl auth issue \
+  --key issuer-key.pem \
+  --subject billing-svc-01 \
+  --account default \
+  --scope produce:events \
+  --scope consume:orders \
+  --ttl 24h \
+  --output /etc/holocron/billing-svc.jwt
+```
+
+`--output` writes the token to a file (mode `0600`); omit it to print to stdout (useful for piping into `kubectl create secret`). `--scope` accepts repeated values. `--issuer` sets the optional `iss` claim — the operator identity that signed.
+
+### Inspecting a token
+
+`holocronctl auth inspect` decodes any JWT (no signature verification — it's a debugging tool). Useful for triaging "why was my client rejected" cases:
+
+```bash
+$ holocronctl auth inspect --token "$(cat /etc/holocron/billing-svc.jwt)"
+# header
+{"alg":"EdDSA","typ":"JWT"}
+# claims
+{"sub":"billing-svc-01","holocron.account":"default","holocron.scopes":["produce:events"],"iat":1747000000,"exp":1747086400}
+# exp:  2026-05-13T12:00:00Z (23h59m48s remaining)
+```
+
+Pipe a token in via stdin if you'd rather: `cat token.jwt | holocronctl auth inspect`. Add `--json` for machine-readable output.
+
+### Connecting clients
+
+Subcommands accept `--credential-file` (and the matching `HOLOCRON_CREDENTIAL_FILE` env var) to dial a JWT-protected broker:
+
+```bash
+holocronctl topic list --addr broker.example.com:9092 \
+  --tls-ca /etc/holocron/ca.pem \
+  --credential-file /etc/holocron/billing-svc.jwt
+```
+
+`--credential-file` and the legacy `--api-key` are mutually exclusive — supply one or the other. The Go SDK has the matching `holocronnet.WithCredential(sdk.LoadCredentialFile(path))`; see [`integration-go.md`](integration-go.md#authentication).
 
 ## Denylist (revocation)
 
@@ -125,9 +167,7 @@ The reload is atomic — no in-flight handshake observes a half-loaded set. A re
 
 ## Limitations and roadmap
 
-- **No client-side JWT support yet.** Until PR 5 of the auth wave lands, the SDK's `WithAPIKey` is the only credential option — which means existing clients can't connect to a broker with `--auth-issuer-key` set. The flag is operational today (rejects forged tokens correctly), but practical use waits on the SDK and CLI updates.
-- **No `holocronctl auth issue` subcommand yet** — lands in PR 6. Until then, issue tokens programmatically via `auth.IssueJWT(privateKey, claims)`.
-- **No mTLS-CN-as-Principal mapping** — the architect's design includes `--auth-mtls-cn-mapping` so a verified client cert's CN can serve as the Principal without a separate JWT. Carved out to a smaller follow-on PR.
+- **No mTLS-CN-as-Principal mapping** — the design includes `--auth-mtls-cn-mapping` so a verified client cert's CN can serve as the Principal without a separate JWT. Carved out to a smaller follow-on PR.
 - **No authorization yet.** Every authenticated Principal has full access. Per-topic ACLs and per-account quotas already exist for the legacy API-key path; threading the `Principal.Scopes` field through them is on the Wave-1 list.
 - **Single signing key.** Multi-key trust ("accept tokens signed by either the old or new key during rollover") is a planned follow-on. Today, rotating the operator key is a planned restart.
 - **Operator key sits on disk.** A KMS adapter (AWS KMS / Vault Transit) is on the radar — the `Signer` interface is shaped for it — but file-on-disk is the v1 default.

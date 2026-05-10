@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -44,6 +45,7 @@ func runGroupList(args []string) error {
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -52,7 +54,11 @@ func runGroupList(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -89,6 +95,7 @@ func runGroupDescribe(args []string) error {
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -100,7 +107,11 @@ func runGroupDescribe(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -144,6 +155,7 @@ func runGroupOffsets(args []string) error {
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -155,7 +167,11 @@ func runGroupOffsets(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -214,6 +230,7 @@ func runGroupDelete(args []string) error {
 	group := fs.String("group", "", "group name (required)")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -225,7 +242,11 @@ func runGroupDelete(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -257,6 +278,7 @@ func runGroupResetAll(args []string) error {
 	to := fs.String("to", "", "earliest | latest (required)")
 	timeout := fs.Duration("timeout", 10*time.Second, "RPC timeout (covers all partitions)")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -271,7 +293,11 @@ func runGroupResetAll(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -319,6 +345,7 @@ func runGroupRename(args []string) error {
 	newName := fs.String("new", "", "new group name (required)")
 	timeout := fs.Duration("timeout", 10*time.Second, "RPC timeout (covers the full rename)")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -333,7 +360,11 @@ func runGroupRename(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}

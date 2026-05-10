@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/jedi-knights/holocron/cli/internal/clienttls"
@@ -26,6 +27,7 @@ func runTopicHead(args []string) error {
 	max := fs.Int("max", 10, "maximum records to print")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -39,7 +41,7 @@ func runTopicHead(args []string) error {
 	if err != nil {
 		return err
 	}
-	return readPartitionRange(*addr, *apiKey, cfg, *topic, int32(*partition), 0, *max, *timeout)
+	return readPartitionRange(*addr, *credFile, *apiKey, cfg, *topic, int32(*partition), 0, *max, *timeout)
 }
 
 // runTopicLast prints the last --max records of a partition. Reads
@@ -56,6 +58,7 @@ func runTopicLast(args []string) error {
 	max := fs.Int("max", 10, "maximum records to print")
 	timeout := fs.Duration("timeout", 5*time.Second, "RPC timeout")
 	tlsCfg := clienttls.RegisterFlags(fs)
+	credFile := fs.String("credential-file", os.Getenv("HOLOCRON_CREDENTIAL_FILE"), "path to a JWT file (mutually exclusive with --api-key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -70,7 +73,11 @@ func runTopicLast(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := dial(*addr, *apiKey, dialOpts(cfg)...)
+	opts, err := credentialOpts(*credFile, *apiKey, dialOpts(cfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(*addr, opts...)
 	if err != nil {
 		return err
 	}
@@ -87,7 +94,7 @@ func runTopicLast(args []string) error {
 		from = 0
 	}
 	tr.Close() // readPartitionRange opens its own dial.
-	return readPartitionRange(*addr, *apiKey, cfg, *topic, int32(*partition), from, *max, *timeout)
+	return readPartitionRange(*addr, *credFile, *apiKey, cfg, *topic, int32(*partition), from, *max, *timeout)
 }
 
 // readPartitionRange reads up to maxRecords from the partition
@@ -97,8 +104,16 @@ func runTopicLast(args []string) error {
 // elapses with the channel idle (whichever comes first) — partial
 // reads are not an error since high-water - max can land before
 // records exist.
-func readPartitionRange(addr, apiKey string, tlsCfg *tls.Config, topic string, partition int32, fromOffset int64, maxRecords int, timeout time.Duration) error {
-	tr, err := dial(addr, apiKey, dialOpts(tlsCfg)...)
+//
+// credFile and apiKey come from the caller's flag set and are
+// threaded through credentialOpts so the per-subcommand --api-key /
+// --credential-file flags both reach the dial here.
+func readPartitionRange(addr, credFile, apiKey string, tlsCfg *tls.Config, topic string, partition int32, fromOffset int64, maxRecords int, timeout time.Duration) error {
+	opts, err := credentialOpts(credFile, apiKey, dialOpts(tlsCfg)...)
+	if err != nil {
+		return err
+	}
+	tr, err := dial(addr, opts...)
 	if err != nil {
 		return err
 	}
