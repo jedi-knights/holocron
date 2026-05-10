@@ -39,6 +39,51 @@ func (AnonymousVerifier) Verify(_ Credential) (Principal, error) {
 	return Anonymous, nil
 }
 
+// APIKeyVerifier accepts CredentialAPIKey credentials whose byte
+// content matches one of the configured keys. It exists as a bridge
+// from the legacy WithAPIKeys deployment shape to the new
+// TokenVerifier interface; new deployments should use Ed25519Verifier
+// (signed JWTs) instead. Anonymous handshake and JWT credentials are
+// rejected — configuring an APIKeyVerifier is opt-in to
+// auth-required mode.
+type APIKeyVerifier struct {
+	keys map[string]struct{}
+}
+
+// NewAPIKeyVerifier returns a verifier accepting any of the listed
+// keys. Empty key strings are ignored.
+func NewAPIKeyVerifier(keys ...string) *APIKeyVerifier {
+	v := &APIKeyVerifier{keys: make(map[string]struct{}, len(keys))}
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		v.keys[k] = struct{}{}
+	}
+	return v
+}
+
+// Verify implements TokenVerifier. The Subject of the returned
+// Principal is the matched API key (so per-key ACLs and quotas keep
+// working unchanged), and Source is SourceAPIKey.
+func (v *APIKeyVerifier) Verify(cred Credential) (Principal, error) {
+	switch cred.Kind {
+	case CredentialAPIKey:
+		// fall through
+	case CredentialNone:
+		return Principal{}, errors.New("auth: anonymous credential rejected (APIKeyVerifier configured)")
+	case CredentialJWT:
+		return Principal{}, errors.New("auth: JWT credential against APIKeyVerifier; configure Ed25519Verifier instead")
+	default:
+		return Principal{}, fmt.Errorf("auth: unsupported credential kind %d", cred.Kind)
+	}
+	key := string(cred.Bytes)
+	if _, ok := v.keys[key]; !ok {
+		return Principal{}, errors.New("auth: invalid API key")
+	}
+	return Principal{Subject: key, Source: SourceAPIKey}, nil
+}
+
 // Ed25519Verifier verifies JWTs signed by an operator-held Ed25519
 // public key. CredentialNone is rejected — that's the
 // AnonymousVerifier's job; any verifier configured with a key has

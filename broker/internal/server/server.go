@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jedi-knights/holocron/broker/internal/auth"
 	"github.com/jedi-knights/holocron/broker/internal/broker"
 	"github.com/jedi-knights/holocron/broker/internal/cluster"
 	"github.com/jedi-knights/holocron/broker/internal/groups"
@@ -67,10 +68,10 @@ type Server struct {
 	conns         map[net.Conn]struct{}
 	closing       bool
 	wg            sync.WaitGroup
-	apiKeys       map[string]struct{}
-	produceQuotas map[string]*tokenBucket // per-API-key produce limiter
-	fetchQuotas   map[string]*tokenBucket // per-API-key fetch limiter
-	acls          map[string]aclEntry     // per-API-key authorization
+	verifier      auth.TokenVerifier      // produces a Principal at handshake; defaults to AnonymousVerifier
+	produceQuotas map[string]*tokenBucket // per-Principal-Subject produce limiter
+	fetchQuotas   map[string]*tokenBucket // per-Principal-Subject fetch limiter
+	acls          map[string]aclEntry     // per-Principal-Subject authorization
 }
 
 // ACL is the public-facing per-key authorization table. Produce and
@@ -239,20 +240,36 @@ func (s *Server) fetchLimiterFor(apiKey string) *tokenBucket {
 
 // SetAPIKeys configures the set of API keys this Server accepts. An
 // empty set disables authentication (any handshake is admitted).
+//
+// Internally constructs an auth.APIKeyVerifier and routes through
+// SetVerifier — preserved for embed.WithAPIKeys callers; new code
+// should use SetVerifier directly.
 func (s *Server) SetAPIKeys(keys []string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if len(keys) == 0 {
-		s.apiKeys = nil
+		s.SetVerifier(auth.AnonymousVerifier{})
 		return
 	}
-	s.apiKeys = make(map[string]struct{}, len(keys))
-	for _, k := range keys {
-		s.apiKeys[k] = struct{}{}
-	}
+	s.SetVerifier(auth.NewAPIKeyVerifier(keys...))
 }
 
-// New returns a Server bound to the given Broker.
+// SetVerifier installs an auth.TokenVerifier. The verifier is called
+// once per connection at handshake; the resulting Principal's Subject
+// becomes the apiKey string flowing through the rest of the request
+// path (preserved unchanged in PR 3 to keep ACL/quota lookups working;
+// PR 7 threads the full Principal).
+func (s *Server) SetVerifier(v auth.TokenVerifier) {
+	if v == nil {
+		v = auth.AnonymousVerifier{}
+	}
+	s.mu.Lock()
+	s.verifier = v
+	s.mu.Unlock()
+}
+
+// New returns a Server bound to the given Broker. The default
+// verifier is AnonymousVerifier — every handshake admits, no
+// credential is required. Callers wire a real verifier via
+// SetVerifier (or SetAPIKeys for the legacy bearer flow).
 func New(b *broker.Broker) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
@@ -260,6 +277,7 @@ func New(b *broker.Broker) *Server {
 		ctx:       ctx,
 		cancelCtx: cancel,
 		conns:     make(map[net.Conn]struct{}),
+		verifier:  auth.AnonymousVerifier{},
 	}
 }
 
@@ -424,25 +442,27 @@ func (s *Server) handshake(r io.Reader, w io.Writer) (string, error) {
 			fmt.Sprintf("server speaks v%d, client v%d", proto.WireVersion, hs.Version))
 		return "", errors.New("handshake: version mismatch")
 	}
-	// Wire v10 carries the credential as a kind-tagged byte slice. PR
-	// 2 keeps the existing API-key allow-list behaviour by extracting
-	// the legacy bearer when CredentialKind == APIKey; PR 3 replaces
-	// this block with auth.TokenVerifier.Verify and threads a
-	// Principal through the rest of the request path.
-	apiKey := ""
-	if hs.CredentialKind == proto.CredentialAPIKey {
-		apiKey = string(hs.Credential)
-	}
+	// Hand the wire credential to the configured verifier. Default
+	// (AnonymousVerifier) admits every handshake and returns the
+	// Anonymous principal; APIKeyVerifier and Ed25519Verifier reject
+	// invalid credentials before any other RPC runs.
 	s.mu.Lock()
-	keys := s.apiKeys
+	verifier := s.verifier
 	s.mu.Unlock()
-	if len(keys) > 0 {
-		if _, ok := keys[apiKey]; !ok {
-			_ = proto.WriteErrorResponse(w, op, proto.StatusUnauthorized, "invalid API key")
-			return "", errors.New("handshake: unauthorized")
-		}
+	cred := auth.Credential{
+		Kind:  auth.CredentialKind(hs.CredentialKind),
+		Bytes: hs.Credential,
 	}
-	return apiKey, proto.WriteResponse(w, op, proto.StatusOK, []byte{proto.WireVersion})
+	principal, err := verifier.Verify(cred)
+	if err != nil {
+		_ = proto.WriteErrorResponse(w, op, proto.StatusUnauthorized, err.Error())
+		return "", fmt.Errorf("handshake: %w", err)
+	}
+	// Principal.Subject becomes the apiKey string flowing through the
+	// rest of the request path. Anonymous → empty string, which
+	// matches the historical no-auth behaviour for ACL / quota
+	// lookups. PR 7 threads the full Principal through cluster.Apply.
+	return principal.Subject, proto.WriteResponse(w, op, proto.StatusOK, []byte{proto.WireVersion})
 }
 
 func (s *Server) dispatch(op proto.OpCode, apiKey string, body []byte, w io.Writer) error {
