@@ -39,8 +39,9 @@ func runAuthIssue(args []string) error {
 	issuer := fs.String("issuer", "", "JWT iss claim (optional; audit-logged by the broker)")
 	ttl := fs.Duration("ttl", 24*time.Hour, "token validity window from now")
 	output := fs.String("output", "", "write the token to this path instead of stdout")
+	allAccess := fs.Bool("all-access", false, "shorthand for --scope produce:* --scope consume:* --scope admin:* (dev/ops convenience; mutually exclusive with --scope)")
 	var scopes stringSliceFlag
-	fs.Var(&scopes, "scope", "JWT holocron.scopes entry — repeat to add multiple (e.g. --scope produce:events --scope consume:orders)")
+	fs.Var(&scopes, "scope", "JWT holocron.scopes entry — repeat to add multiple. Grammar: verb:resource[*]; verbs are produce, consume, admin (e.g. --scope produce:events --scope consume:orders.* --scope admin:billing)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -53,6 +54,12 @@ func runAuthIssue(args []string) error {
 	}
 	if *ttl <= 0 {
 		return errors.New("auth issue: --ttl must be positive")
+	}
+	if *allAccess && len(scopes) > 0 {
+		return errors.New("auth issue: --all-access and --scope are mutually exclusive")
+	}
+	if *allAccess {
+		scopes = stringSliceFlag{"produce:*", "consume:*", "admin:*"}
 	}
 
 	priv, err := cliauth.LoadEd25519PrivateKey(*keyPath)
